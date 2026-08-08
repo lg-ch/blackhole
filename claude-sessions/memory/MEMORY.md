@@ -1,0 +1,54 @@
+- [User preferences](user_preferences.md) — French, I/O-economic thinker, spots redundant sweeps, prefers high-impact interventions
+- [hd_ann_test SIFT 1M tuning](project_hd_ann_sift.md) — learnings: defaults over-dimensioned, main lever is pool not nl, --gen not persisted in forest.bin (silent wrong-recall bug)
+- [Sweep efficiency feedback](feedback_bench_efficiency.md) — factor out expensive work before sweeping downstream cutoffs, don't re-run full pipeline per parameter
+- [Leaf-coverage exploration](project_leaf_coverage_experiment.md) — Sweep SIFT 1M : Pareto sign-split = 0.98 recall @ ~63k sum_leaf. sub_dim quasi-neutre, sd8 sweet spot.
+- [Sign-split > median](feedback_sign_vs_median.md) — Cible projet = zéro RAM data-dépendante. Sign gagne par construction (seed → hyperplan), median exige threshold/nœud. Pareto sum_leaf trompeur ici.
+- [mangrove vs mangrove-search](reference_mangrove_project.md) — cwd `mangrove-search/` héberge MAINTENANT les deux : ancien `hd_ann_test.cpp` ET nouveau `pairwise_test.cpp` (pairwise-seed, builds `pw_*`). Travail actif = pairwise.
+- [Freq-count = K-way merge](feedback_freq_count_design.md) — posting lists triées par construction (doc_ids séquentiels) → K-way merge streaming, RAM O(K) ~4 KB, exact. Préférer à CMS/dense/hashmap pour le scaling 1B.
+- [rpforest SIFT 1M/10M](project_rpforest_sift.md) — Phase 5 sorted `.srt` : SIFT 1M 70 ms@99.77% / SIFT 10M 130 ms@97.7% sous cgroup 300M. Sweet spot empirique 2-4 docs/leaf : ne pas suivre `depth = log₂(N)` aveuglément.
+- [n_trees sweep déjà fait](feedback_n_trees_sweep.md) — ne pas proposer "moins d'arbres" comme levier perf : recall chute sous 1000 (testé hors session).
+- [Depth = discriminance des votes](feedback_depth_vote_discrimination.md) — depth choisi par discriminance des votes, pas par flexibilité. Décision projet : depth=25 fixé pour multi-index famille (target 1B combinés). Code query_depth déjà en place pour sous-corpora.
+- [Leviers recall : SIFT top_n>>qd, MAIS dim=768 INVERSÉ](feedback_recall_levers.md) — sur dim=128 top_n domine ; sur dim=768 c'est qd qui domine (qd 20→16 gagne +28 pts recall pour 14ms). Mécanisme : sub_dim=16/768 = splits peu discriminants → élargir scope.
+- [Pre-filter vs post-filter strategy](feedback_filter_strategy.md) — Pre = discriminant (pilote), post = non-discriminant (valide). Seuil ~3% density à 1B. CRoaring intégré, bench arxiv 2M : forest p99 7 ms, filter coûte zéro.
+- [filter_mode crossover empirique](project_filter_mode_crossover.md) — bench SIFT 100k post adaptive-oversample : crossover ~10-15 % (pas ~3 %), post sound partout (overlap 1.00 vs 0.06 avant).
+- [arXiv 2M + ClickHouse + CRoaring](project_arxiv_2m_clickhouse.md) — Stack live : pré-agg `groupBitmapState`, format wire compact (17 B-27 KB), p99 RAG 8-16 ms / 2M docs / dim 768.
+- [Roadmap prod](project_roadmap_prod.md) — Bloqueurs 1B (filter-aware I/O, voie A multi-index, delta encoding doc_ids) + prod-ready (FFI/SDK, telemetry, atomic write, graceful degradation).
+- [Pas de mmap hot path](feedback_no_mmap.md) — règle design : io_uring + O_RDONLY, pas mmap. Préserve la différenciation RAM-négligeable (sinon RssFile pollue les métriques sur machines RAM-rich).
+- [Décide, n'empile pas les questions](feedback_decide_dont_ask.md) — quand le contexte (memory + roadmap + dits récents) suffit à décider, fais — ne pas reposer 2-4 AskUserQuestion en série.
+- [SSD prod](reference_ssd_layout.md) — Crucial X10 8 TB ext4 sur `/mnt/mangrove/{datasets,indexes,wal,scratch}`. UUID d8240adf-acae-4705-b789-faf07b91cd6b. Write 1.1 GB/s, read 1.5 GB/s.
+- [auto_qd_v2 target_ratio corpus-spécifique](feedback_target_ratio.md) — default 0.001 OK pour SIFT (dim 128), arxiv (dim 768) demande 0.05 — scale avec sub_dim/dim. La formule fonctionne, c'est juste ce param qu'il faut tuner.
+- [SIFT 1B perf baseline = 5p/16k radix](project_sift1b_perf.md) — 256t+5probes+top_n16000 + radix sort path : **single CPU 722 ms p50 / recall 0.993, parallel ×10 130 ms p50** sur SIFT 1B réel. Cumulé vs heap baseline : ÷4.3 single, ÷2.2 parallel. RAM 935 MB / disque 0.85 TB préservés. La pivot 10p→5p compensé par top_n 8k→16k = même recall, -28 % latence. Voir BENCH.md SIFT 1B section pour la timeline complète.
+- [Kube/Helm deploy validé](project_kube_helm_deploy.md) — kind+Helm, SIFT 1M e2e OK (recall 0.999, filter 1.000). Chart : CH ajouté + bug selector cross-match Service mangrove↔CH corrigé. Ne pas delete STS pour restart.
+- [Cold/warm bench protocol](feedback_cold_warm_protocol.md) — jamais livrer un tableau latence sans préciser cold/warm ; drop_caches entre configs pour chiffres publiables (2 incidents)
+- [EN plus dur que IT/NO](project_en_corpus_difficulty.md) — Wikipedia EN v3 : voisins GT plus distants (sim top10 0.67 vs 0.73 IT) → recall RP-forest plus dur. Pas un bug, propriété du corpus.
+- [TurboQuant rerank](project_turboquant_rerank.md) — LIVRÉ : recall identique, -29/-43% latence, IOPS-bound → next = codes dans les leaves (SRT4)
+- [TQ1 (1-bit) sidecar](project_tq1.md) — LIVRÉ : recall identique TQ4 avec K'×5, disque /4, cold -17%, arxiv 2M atteint **1.000** à NP=10 QD=14 top_n=64k / 110 ms.
+- [SRT4 disqualifié](project_srt4_disqualified.md) — inline codes ×n_trees = 4 TB sur DEEP 1B. Pivot recommandé : SIMD TQ1 + multi-thread merge.
+- [Roadmap papier](project_paper_roadmap.md) — Bench panel mangrove vs HNSW vs FAISS-IVF, 8-13 datasets. Point ouvert : Cohere v3 ≥ 100M dispo ? (WebSearch différé).
+- [tree_sub + groupes partagés](project_tree_sub_groups.md) — Sweet spot g=16, ts ∈ {64,128} sur arxiv 2M (+1.9 pt QD=16 vs ctrl). Patch latent pick_dims identity quand full_dim ≤ sub_dim.
+- [NQ BEIR validation](project_nq_beir_validation.md) — 0.81 recall@10 / 0.61 nDCG@10 / 197 ms sur NQ Cohere v3 = SOTA-comparable. Valide hypothèse query-to-doc vs doc-to-doc artificiellement dur.
+- [Check meta.txt depth](feedback_check_meta_depth.md) — Forest(depth=X) avec X≠build silencieusement KO (recall ~3%). Toujours lire meta.txt avant.
+- [DEEP results](project_deep_results.md) — DEEP 10M recall 1.000 exact / 0.995 TQ (-46% lat). Fbin natif. 1B téléchargé prêt pour build complet.
+- [Makefile header deps](feedback_makefile_header_deps.md) — toucher un .h NE rebuild PAS les .o (pas de -MMD). Workflow safe : `touch src/*.c src/*.h && make`. Cause de bugs runtime silencieux.
+- [RAM < 1 GB tout le temps](feedback_ram_1gb_hard.md) — règle dure projet, build inclus. Pas d'optim qui pique > 1 GB même temporairement. Rejet 2026-06-15 d'une mémoïsation RNG build (1.6 GB peak).
+- [leaf_docs max_n trap](feedback_leaf_docs_max_n.md) — `max_n=8192` tronque silencieusement les grosses leaves. À d=12 natif (leaves ~2400 avg, jusqu'à 118k), 16% docs invisibles. 3h de chase 2026-07-05.
+- [max_leaf_bytes lever](project_max_leaf_bytes_lever.md) — CAP les méga-leaves à shallow depth : peak RSS ÷1.5, recall +0.003, latence -33%. Config sweet spot DEEP 100M : mlb=200_000 → 0.960 recall / 280ms sous 1 GB.
+- [DEEP 1B pathrank baseline](project_deep1b_results.md) — Build d=18 --fast (30h, 639 GB). NP=3 1024×4000 mlb=200k : 0.970 recall / 530 ms p50 cold sous 1G strict. -22% latence / -27% RAM vs SIFT 1B baseline.
+- [Préprint roadmap 2026-07-15](project_preprint_roadmap.md) — Plan fin : (1) auto-tune finish, (2) parallel query 4-8 cores, (3) LAION-400M 768d, (4) RAG chunks SDK, (5) recovery demo. Deferred : LSM compaction, adaptive depth, metadata mgmt.
+- [Query deadline gap](project_query_deadline_gap.md) — `mg_query_pathrank` n'observe pas de deadline_ns → fat-tail queries bloquent le serveur. Ajouter avant recovery demo.
+- [Deadline + fallback LIVRÉ](project_deadline_and_fallback.md) — deadline_ns C + query_pathrank_with_fallback SDK validés SIFT 1B. Table budget→recall (1G: 0.963 max, 2G: 0.977 max).
+- [Auto-tune doubling](project_autotune_doubling.md) — schedule prod : recalib à chaque doublement depuis 100k + drift/recall triggers. ~14 checkpoints pour 1B, ~70 min total.
+- [Parallel query = SSD-bound](project_parallel_query_ssd_bound.md) — multi-ring io_uring reverté. Cold single-query SIFT 1B = SSD-throughput-bound (~500 ms floor). Affinity 8 cores = seul levier. Multi-ring garderait sens pour QPS scaling + high-dim.
+- [SRT V2 vs V3 tradeoff](project_srt_v2_vs_v3.md) — V2 (raw uint32) coûte 1.75× disque, 0 diff latence, RAM +10%, recall exact. `--no-varbyte` build flag.
+- [WAL streaming demo](project_wal_streaming_demo.md) — Producer→WAL→Consumer avec `--tail` + pause+recalib validé end-to-end. 250k docs @ 8k/s, sync producer/consumer, recommended_config.json auto-écrit.
+- [OMP subprocess bug récurrent](feedback_omp_subprocess_bug.md) — Ne JAMAIS set `os.environ['OMP_NUM_THREADS']='1'` au top d'un driver Python qui spawn rpforest build. Hérité par subprocess → build 5-10× lent.
+- [LSM prototype validé](project_lsm_prototype.md) — SIFT 10M d=28 : LSM 5×2M préserve recall EXACT (0.767 identique mono), coût 1.68× latence. `mg_query_pathrank_multi` en C (traversal partagée). Fair budget = tp/seg = tp/mono (pas divisé).
+- [Slot allocator format .slt](project_slot_allocator.md) — Writer C livré, +48% storage overhead SIFT 10M. Query reader C à finir next session. Design streaming MAIN+HOT dessus.
+- [Streaming MVP livré](project_streaming_v1.md) — HOT thread-safe + per-tree compaction + swap dir. E2E SIFT 10M validé 2026-07-17.
+- [Streaming 1B validé](project_streaming_1b_validated.md) — disk-HOT per-leaf sur SIFT 1B 256 trees : +3.3% mean / -1.3% p99 vs idle. RAM 50 MB, ingest 1k vec/s sustained.
+- [API deux modes ingestion](project_bulk_streaming_api.md) — `bulk_import()` (rebuild+swap 15-40k/s) vs `insert()` (streaming HOT 1k/s). Refus explicite si HOT non-vide au start.
+- [Profil par phase query](project_query_phase_profile.md) — DEEP 1B laptop : phase1 30%, phase2 30%, **radix 25%** (surprise). Warm sous cgroup 1G ≈ inexistant pour leaf data. Timers `mg_get_phase_ms` en place.
+- [Verdicts stockage + sub_dim](project_storage_and_subdim_verdicts.md) — X10 vs NVMe ×7-9 end-to-end mesuré ; sub_dim=16 optimal (full-dim = rien) ; projection 1B NVMe ~100-160 ms ; 5 hypothèses d'optim fermées.
+- [Serveur build Vultr](reference_vultr_build_server.md) — ssh root@199.247.15.211, DEEP 1B en local, quirks gcc15/CRoaring/liburing résolus
+- [Tree-batched build](project_tree_batched_build.md) — `--tree_offset/--total_trees` borne le pic disque (pair files non-compressés = N×docs×8) ; prouvé byte-identique ; permet 1B sur < 2 TB
+- [Médianes top-levels VALIDÉES](project_median_toplevels.md) — p99 ÷2.5-3 iso-recall, pool ÷2.2-3.3, queue ÷4.4, build -35%, 10M@0.93 = 16ms/68MB RSS. Candidat défaut v1 (md=12). Piège: calibration = même gen_version que build.
