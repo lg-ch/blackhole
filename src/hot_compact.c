@@ -189,10 +189,14 @@ int hot_compact_tree(const char* main_path,
         if (lid_m == lid) {
             uint32_t off_now  = main_sparse[im].offset;
             uint32_t off_next = main_sparse[im + 1].offset;
-            /* Grow leaf_buf if needed (upper bound = leaf byte size). */
-            uint32_t upper = is_v3 ? (off_next - off_now) : (off_next - off_now);
-            if (upper + hot_snap[ih].n_docs > buf_cap) {
-                while (buf_cap < upper + hot_snap[ih].n_docs + 8) buf_cap *= 2;
+            /* Grow leaf_buf if needed (upper bound = leaf byte size).
+               Only count HOT docs when THIS leaf also has a HOT entry —
+               hot_snap[ih] past the array is garbage and a huge value here
+               overflows buf_cap's doubling into an infinite loop. */
+            uint32_t hot_here = (lid_h == lid) ? hot_snap[ih].n_docs : 0u;
+            uint32_t upper = off_next - off_now;
+            if ((uint64_t)upper + hot_here + 8 > buf_cap) {
+                while (buf_cap < (uint64_t)upper + hot_here + 8) buf_cap *= 2;
                 uint32_t* nb = (uint32_t*)realloc(leaf_buf, (size_t)buf_cap * sizeof(uint32_t));
                 if (!nb) goto err;
                 leaf_buf = nb;

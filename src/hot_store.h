@@ -4,7 +4,11 @@
 /* HOT overlay disk-backed per-leaf.
  *
  * Design :
- *   - Per tree : one .hot file (append-only + slot-alloc, growable)
+ *   - Per (tree, slot class) : one .hot file (append-only slot-alloc). One
+ *     file PER CLASS keeps every class region contiguous, so a slot's byte
+ *     offset is always base + slot_id × class_bytes — mixing classes in a
+ *     single file made regions collide as soon as a promotion interleaved
+ *     the allocations (slots silently overwrote the next class's data).
  *   - Per tree : RAM sparse index sorted by leaf_id (~12 B per delta leaf)
  *   - Query    : RAM lookup (few ns) → if hit, pread slot data (~75 µs cold)
  *
@@ -51,10 +55,9 @@ typedef struct {
     int             cap;
     HotEntry*       entries;          /* sorted asc by leaf_id */
     pthread_mutex_t mu;
-    int             hot_fd;           /* .hot file, O_RDWR         */
+    int             fds[HOT_N_CLASSES];            /* one .hot file per class */
     uint32_t        class_n_slots[HOT_N_CLASSES];  /* next slot id per class */
-    uint64_t        class_data_off[HOT_N_CLASSES]; /* start of class data on disk */
-    uint64_t        file_size;         /* current end-of-file offset */
+    uint64_t        file_size[HOT_N_CLASSES];      /* end-of-file per class file */
 } HotTree;
 
 typedef struct {

@@ -9,32 +9,31 @@
 #include <sys/types.h>
 #include "hot_store.h"
 
-/* File layout .hot :
+/* File layout : ONE file per (tree, class) — tree%05d.c%d.hot :
  *   [4 B magic]
  *   [4 B depth]
  *   [4 B n_classes]
  *   [4 B reserved]
  *   [HOT_N_CLASSES × 4 B class_docs_cap]  (docs per slot per class)
- *   [HOT_N_CLASSES × 4 B class_n_slots]   (dynamic — updated on writes)
- *   [class 0 data | class 1 data | class 2 data | class 3 data]
+ *   [HOT_N_CLASSES × 4 B class_n_slots]   (only entry [c] meaningful here)
+ *   [HOT_N_CLASSES × 8 B legacy zeros]
+ *   [slot 0 | slot 1 | ...]               (this class's slots, contiguous)
  *
- * Classes grow independently ; data blocks are placed sequentially in the
- * order they were allocated. On first-slot-of-a-class allocation, we bump
- * file_size ; class_data_off[c] = the offset at which that class's first
- * slot was allocated. When we allocate slot k in class c :
- *   off = class_data_off[c] + k * (class_docs_cap[c] * 4)
- *
- * When we allocate a NEW class (first time this class gets a slot), we
- * simply extend the file and record class_data_off[c] = file_size.
- * This means classes don't need to be contiguous ; they can be interleaved.
+ * Slot k of class c lives at HOT_HDR_TOTAL + k × class_bytes(c) in ITS OWN
+ * file — contiguous by construction. (The previous single-file layout
+ * computed offsets as class_data_off[c] + k × class_bytes(c), which is only
+ * valid while a class's region is contiguous ; as soon as a promotion
+ * interleaved allocations across classes, a class 0 slot silently
+ * overwrote the start of the class 1 region. One file per class removes
+ * the collision by design.)
  *
  * The RAM index is a sorted array of HotEntry, one per non-empty leaf.
- * Rebuilt from disk on hot_init if the file already exists (linear scan
+ * Rebuilt from disk on hot_init if the files already exist (linear scan
  * of allocated slots — we don't store a persistent index yet; MVP relies
  * on WAL replay from the source of truth in production).
  *
- * Post-snapshot-and-clear, the file is truncated to HEADER_SIZE (dropping
- * all data blocks, class_n_slots reset to 0).
+ * Post-snapshot-and-clear, each class file is truncated to HEADER_SIZE
+ * (dropping all slots, class_n_slots reset to 0).
  */
 
 #define HOT_HEADER_BYTES  16
@@ -54,24 +53,18 @@
 /* Total bytes per slot on disk : 8 B header + payload docs*4. */
 static uint32_t class_bytes(int c) { return HOT_SLOT_HEADER_BYTES + HOT_CLASS_DOCS[c] * 4u; }
 
-static int write_header(HotTree* ht, uint32_t depth) {
+static int write_header(int fd, uint32_t depth) {
     uint32_t hdr[4] = { HOT_MAGIC, depth, HOT_N_CLASSES, 0 };
-    if (pwrite(ht->hot_fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return -1;
+    if (pwrite(fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)) return -1;
     uint32_t cap_arr[HOT_N_CLASSES];
     for (int c = 0; c < HOT_N_CLASSES; c++) cap_arr[c] = HOT_CLASS_DOCS[c];
-    if (pwrite(ht->hot_fd, cap_arr, sizeof(cap_arr), HOT_HEADER_BYTES)
+    if (pwrite(fd, cap_arr, sizeof(cap_arr), HOT_HEADER_BYTES)
         != (ssize_t)sizeof(cap_arr)) return -1;
     /* class_n_slots = zeros initially */
     uint32_t zero[HOT_N_CLASSES] = {0};
-    if (pwrite(ht->hot_fd, zero, sizeof(zero), HOT_HEADER_BYTES + HOT_N_CLASSES * 4)
+    if (pwrite(fd, zero, sizeof(zero), HOT_HEADER_BYTES + HOT_N_CLASSES * 4)
         != (ssize_t)sizeof(zero)) return -1;
     return 0;
-}
-
-static int update_class_n_slots_on_disk(HotTree* ht) {
-    return (pwrite(ht->hot_fd, ht->class_n_slots, HOT_N_CLASSES * 4,
-                   HOT_HEADER_BYTES + HOT_N_CLASSES * 4)
-            == (ssize_t)(HOT_N_CLASSES * 4)) ? 0 : -1;
 }
 
 int hot_init(HotOverlay* h, int n_trees, int depth, const char* dir) {
@@ -82,48 +75,60 @@ int hot_init(HotOverlay* h, int n_trees, int depth, const char* dir) {
     strncpy(h->dir, dir, sizeof(h->dir) - 1);
     h->trees = (HotTree*)calloc((size_t)n_trees, sizeof(HotTree));
     if (!h->trees) return -1;
+    /* Pre-mark every fd invalid so hot_free on a partial init is safe. */
+    for (int t = 0; t < n_trees; t++)
+        for (int c = 0; c < HOT_N_CLASSES; c++) h->trees[t].fds[c] = -1;
     mkdir(dir, 0755);
+    /* Legacy single-file layout : not migrated (HOT is transient — WAL is
+       the source of truth). Warn once so a stale overlay isn't silently
+       ignored. */
+    {
+        char legacy[600];
+        snprintf(legacy, sizeof(legacy), "%s/tree%05d.hot", dir, 0);
+        struct stat lst;
+        if (stat(legacy, &lst) == 0 && lst.st_size > HOT_HDR_TOTAL) {
+            fprintf(stderr, "hot_init: legacy single-file HOT found in %s — "
+                            "ignored (replay the WAL to repopulate)\n", dir);
+        }
+    }
     for (int t = 0; t < n_trees; t++) {
         HotTree* ht = &h->trees[t];
         pthread_mutex_init(&ht->mu, NULL);
-        char path[600];
-        snprintf(path, sizeof(path), "%s/tree%05d.hot", dir, t);
-        struct stat st;
-        int exists = (stat(path, &st) == 0 && st.st_size >= HOT_HDR_TOTAL);
-        ht->hot_fd = open(path, O_RDWR | O_CREAT, 0644);
-        if (ht->hot_fd < 0) {
-            fprintf(stderr, "hot_init: open %s failed\n", path);
-            hot_free(h); return -1;
+        int any_existing = 0;
+        for (int c = 0; c < HOT_N_CLASSES; c++) {
+            char path[600];
+            snprintf(path, sizeof(path), "%s/tree%05d.c%d.hot", dir, t, c);
+            struct stat st;
+            int exists = (stat(path, &st) == 0 && st.st_size >= HOT_HDR_TOTAL);
+            ht->fds[c] = open(path, O_RDWR | O_CREAT, 0644);
+            if (ht->fds[c] < 0) {
+                fprintf(stderr, "hot_init: open %s failed\n", path);
+                hot_free(h); return -1;
+            }
+            if (!exists) {
+                if (ftruncate(ht->fds[c], HOT_HDR_TOTAL) != 0 ||
+                    write_header(ht->fds[c], (uint32_t)depth) != 0) {
+                    hot_free(h); return -1;
+                }
+                ht->file_size[c] = HOT_HDR_TOTAL;
+            } else {
+                uint32_t hdr[4];
+                if (pread(ht->fds[c], hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)
+                    || hdr[0] != HOT_MAGIC) {
+                    fprintf(stderr, "hot_init: bad magic in %s (treating as empty)\n", path);
+                }
+                uint32_t ns[HOT_N_CLASSES];
+                if (pread(ht->fds[c], ns, HOT_N_CLASSES * 4, HOT_CLASS_N_SLOTS_OFF)
+                    == (ssize_t)(HOT_N_CLASSES * 4)) {
+                    ht->class_n_slots[c] = ns[c];
+                }
+                ht->file_size[c] = (uint64_t)st.st_size;
+                any_existing = 1;
+            }
         }
-        if (!exists) {
-            if (ftruncate(ht->hot_fd, HOT_HDR_TOTAL) != 0) {
-                hot_free(h); return -1;
-            }
-            if (write_header(ht, (uint32_t)depth) != 0) {
-                hot_free(h); return -1;
-            }
-            ht->file_size = HOT_HDR_TOTAL;
-        } else {
-            uint32_t hdr[4];
-            if (pread(ht->hot_fd, hdr, sizeof(hdr), 0) != (ssize_t)sizeof(hdr)
-                || hdr[0] != HOT_MAGIC) {
-                fprintf(stderr, "hot_init: bad magic in %s (treating as empty)\n", path);
-            }
-            if (pread(ht->hot_fd, ht->class_n_slots, HOT_N_CLASSES * 4,
-                      HOT_CLASS_N_SLOTS_OFF)
-                != (ssize_t)(HOT_N_CLASSES * 4)) {
-                memset(ht->class_n_slots, 0, sizeof(ht->class_n_slots));
-            }
-            if (pread(ht->hot_fd, ht->class_data_off, HOT_N_CLASSES * 8,
-                      HOT_CLASS_OFF_ARRAY_OFF)
-                != (ssize_t)(HOT_N_CLASSES * 8)) {
-                memset(ht->class_data_off, 0, sizeof(ht->class_data_off));
-            }
-            ht->file_size = (uint64_t)st.st_size;
-            if (hot_recover_tree(h, t) < 0) {
-                fprintf(stderr, "hot_init: recover tree %d failed\n", t);
-                hot_free(h); return -1;
-            }
+        if (any_existing && hot_recover_tree(h, t) < 0) {
+            fprintf(stderr, "hot_init: recover tree %d failed\n", t);
+            hot_free(h); return -1;
         }
     }
     return 0;
@@ -134,7 +139,9 @@ void hot_free(HotOverlay* h) {
     for (int t = 0; t < h->n_trees; t++) {
         HotTree* ht = &h->trees[t];
         if (ht->entries) free(ht->entries);
-        if (ht->hot_fd >= 0) close(ht->hot_fd);
+        for (int c = 0; c < HOT_N_CLASSES; c++) {
+            if (ht->fds[c] >= 0) close(ht->fds[c]);
+        }
         pthread_mutex_destroy(&ht->mu);
     }
     free(h->trees);
@@ -161,37 +168,28 @@ static int hot_lower_bound(const HotTree* ht, uint32_t leaf_id) {
     return lo;
 }
 
-/* Compute byte offset on disk for a given (class, slot). */
+/* Byte offset of a slot inside ITS CLASS FILE — contiguous by design. */
 static uint64_t slot_offset(const HotTree* ht, int cls, uint32_t slot) {
-    return ht->class_data_off[cls] + (uint64_t)slot * class_bytes(cls);
+    (void)ht;
+    return HOT_HDR_TOTAL + (uint64_t)slot * class_bytes(cls);
 }
 
-/* Persist one class's slot count on disk. */
+/* Persist one class's slot count in that class's file. */
 static void persist_class_n_slots(HotTree* ht, int cls) {
-    pwrite(ht->hot_fd, &ht->class_n_slots[cls], 4,
+    pwrite(ht->fds[cls], &ht->class_n_slots[cls], 4,
            (off_t)(HOT_CLASS_N_SLOTS_OFF + cls * 4));
 }
-/* Persist one class's data offset on disk (called on first-slot alloc). */
-static void persist_class_data_off(HotTree* ht, int cls) {
-    pwrite(ht->hot_fd, &ht->class_data_off[cls], 8,
-           (off_t)(HOT_CLASS_OFF_ARRAY_OFF + cls * 8));
-}
 
-/* Allocate new slot in class c. Returns slot_id, updates class_n_slots
- * and file_size. First allocation in a class sets class_data_off[c]. */
+/* Allocate new slot in class c : grows that class's own file. */
 static uint32_t alloc_slot(HotTree* ht, int cls) {
     uint32_t slot = ht->class_n_slots[cls];
-    if (slot == 0) {
-        ht->class_data_off[cls] = ht->file_size;
-        persist_class_data_off(ht, cls);
-    }
     ht->class_n_slots[cls]++;
     persist_class_n_slots(ht, cls);
-    uint64_t new_end = ht->class_data_off[cls]
+    uint64_t new_end = HOT_HDR_TOTAL
                      + (uint64_t)ht->class_n_slots[cls] * class_bytes(cls);
-    if (new_end > ht->file_size) {
-        if (ftruncate(ht->hot_fd, new_end) != 0) { /* soft-fail */ }
-        ht->file_size = new_end;
+    if (new_end > ht->file_size[cls]) {
+        if (ftruncate(ht->fds[cls], new_end) != 0) { /* soft-fail */ }
+        ht->file_size[cls] = new_end;
     }
     return slot;
 }
@@ -223,10 +221,10 @@ int hot_append(HotOverlay* h, int tree_id, uint32_t leaf_id, uint32_t doc_id) {
             /* Room in current slot : append doc at position n_docs. */
             uint64_t doc_off = slot_payload_off(ht, cur_cls, cur_slot)
                              + (uint64_t)e->n_docs * 4u;
-            if (pwrite(ht->hot_fd, &doc_id, 4, (off_t)doc_off) != 4) goto out;
+            if (pwrite(ht->fds[cur_cls], &doc_id, 4, (off_t)doc_off) != 4) goto out;
             /* Update n_docs in slot header. */
             uint32_t new_n = e->n_docs + 1;
-            if (pwrite(ht->hot_fd, &new_n, 4,
+            if (pwrite(ht->fds[cur_cls], &new_n, 4,
                        (off_t)(slot_offset(ht, cur_cls, cur_slot) + 4)) != 4) goto out;
             e->n_docs = new_n;
             rc = 0;
@@ -238,18 +236,18 @@ int hot_append(HotOverlay* h, int tree_id, uint32_t leaf_id, uint32_t doc_id) {
             uint64_t old_off  = slot_offset(ht, cur_cls, cur_slot);
             uint32_t buf[256 + 2];   /* header + up to 256 docs */
             uint32_t copy_bytes = e->n_docs * 4u;
-            if (pread(ht->hot_fd, buf, copy_bytes,
+            if (pread(ht->fds[cur_cls], buf, copy_bytes,
                       (off_t)(old_off + HOT_SLOT_HEADER_BYTES))
                 != (ssize_t)copy_bytes) goto out;
             buf[e->n_docs] = doc_id;
             uint32_t new_n = e->n_docs + 1;
             uint32_t hdr[2] = { leaf_id, new_n };
-            if (pwrite(ht->hot_fd, hdr, 8, (off_t)new_off) != 8) goto out;
-            if (pwrite(ht->hot_fd, buf, copy_bytes + 4,
+            if (pwrite(ht->fds[new_cls], hdr, 8, (off_t)new_off) != 8) goto out;
+            if (pwrite(ht->fds[new_cls], buf, copy_bytes + 4,
                        (off_t)(new_off + HOT_SLOT_HEADER_BYTES))
                 != (ssize_t)(copy_bytes + 4)) goto out;
             /* Mark old slot as tombstone (leaf_id=0xFFFFFFFF, n_docs=0). */
-            write_slot_header(ht->hot_fd, old_off, HOT_TOMBSTONE_LEAF, 0);
+            write_slot_header(ht->fds[cur_cls], old_off, HOT_TOMBSTONE_LEAF, 0);
             e->packed = HOT_PACK(new_cls, new_slot);
             e->n_docs = new_n;
             rc = 0;
@@ -268,8 +266,8 @@ int hot_append(HotOverlay* h, int tree_id, uint32_t leaf_id, uint32_t doc_id) {
         uint32_t slot = alloc_slot(ht, 0);
         uint64_t off = slot_offset(ht, 0, slot);
         uint32_t hdr[2] = { leaf_id, 1u };
-        if (pwrite(ht->hot_fd, hdr, 8, (off_t)off) != 8) goto out;
-        if (pwrite(ht->hot_fd, &doc_id, 4, (off_t)(off + HOT_SLOT_HEADER_BYTES)) != 4) goto out;
+        if (pwrite(ht->fds[0], hdr, 8, (off_t)off) != 8) goto out;
+        if (pwrite(ht->fds[0], &doc_id, 4, (off_t)(off + HOT_SLOT_HEADER_BYTES)) != 4) goto out;
         if (i < ht->n_entries) {
             memmove(&ht->entries[i+1], &ht->entries[i],
                     (size_t)(ht->n_entries - i) * sizeof(HotEntry));
@@ -299,7 +297,7 @@ int hot_recover_tree(HotOverlay* h, int tree_id) {
     if (!h || tree_id < 0 || tree_id >= h->n_trees) return -1;
     HotTree* ht = &h->trees[tree_id];
     pthread_mutex_lock(&ht->mu);
-    /* class_n_slots + class_data_off already loaded from disk by hot_init. */
+    /* class_n_slots already loaded from disk by hot_init. */
 
     uint32_t total_slots = 0;
     for (int c = 0; c < HOT_N_CLASSES; c++) total_slots += ht->class_n_slots[c];
@@ -318,7 +316,7 @@ int hot_recover_tree(HotOverlay* h, int tree_id) {
         for (uint32_t s = 0; s < ht->class_n_slots[c]; s++) {
             uint64_t off = slot_offset(ht, c, s);
             uint32_t hdr[2];
-            if (pread(ht->hot_fd, hdr, 8, (off_t)off) != 8) continue;
+            if (pread(ht->fds[c], hdr, 8, (off_t)off) != 8) continue;
             uint32_t lid = hdr[0], nd = hdr[1];
             if (lid == HOT_TOMBSTONE_LEAF) continue;   /* abandoned */
             if (nd == 0 || nd > HOT_CLASS_DOCS[c])   continue;  /* corrupt */
@@ -394,7 +392,7 @@ int hot_snapshot_entry(const HotOverlay* h, int tree_id, int entry_idx,
     /* Payload offset : skip the 8 B slot header. */
     *out_off = slot_offset(ht, cls, slot) + HOT_SLOT_HEADER_BYTES;
     *out_n_docs = e.n_docs;
-    *out_fd = ht->hot_fd;
+    *out_fd = ht->fds[cls];
     pthread_mutex_unlock(&ht->mu);
     return 0;
 }
@@ -413,7 +411,7 @@ int hot_read_entry(const HotOverlay* h, int tree_id, int entry_idx,
     int cls = (int)HOT_CLASS(e.packed);
     uint32_t slot = HOT_SLOT(e.packed);
     uint64_t off = slot_offset(ht, cls, slot);
-    int fd = ht->hot_fd;
+    int fd = ht->fds[cls];
     pthread_mutex_unlock(&ht->mu);
     return read_slot(fd, off, e.n_docs, out_buf, buf_cap, out_n);
 }
@@ -433,7 +431,7 @@ int hot_read(const HotOverlay* h, int tree_id, uint32_t leaf_id,
     int cls = (int)HOT_CLASS(e.packed);
     uint32_t slot = HOT_SLOT(e.packed);
     uint64_t off = slot_offset(ht, cls, slot);
-    int fd = ht->hot_fd;
+    int fd = ht->fds[cls];
     pthread_mutex_unlock(&ht->mu);
     return (read_slot(fd, off, e.n_docs, out_buf, buf_cap, out_n) == 0) ? 1 : -1;
 }
@@ -450,7 +448,9 @@ uint64_t hot_ram_bytes(const HotOverlay* h) {
 uint64_t hot_disk_bytes(const HotOverlay* h) {
     if (!h || !h->trees) return 0;
     uint64_t b = 0;
-    for (int t = 0; t < h->n_trees; t++) b += h->trees[t].file_size;
+    for (int t = 0; t < h->n_trees; t++)
+        for (int c = 0; c < HOT_N_CLASSES; c++)
+            b += h->trees[t].file_size[c];
     return b;
 }
 
@@ -481,22 +481,23 @@ int hot_snapshot_and_clear(HotOverlay* h, int tree_id,
             pthread_mutex_unlock(&ht->mu);
             return -1;
         }
-        if (pread(ht->hot_fd, snap[i].docs, (size_t)e.n_docs * 4u,
+        if (pread(ht->fds[cls], snap[i].docs, (size_t)e.n_docs * 4u,
                   (off_t)(off + HOT_SLOT_HEADER_BYTES))
             != (ssize_t)(e.n_docs * 4u)) {
             /* leave zeros; not fatal for MVP */
         }
     }
-    /* Clear index + truncate file to header. */
+    /* Clear index + truncate every class file to header. */
     free(ht->entries);
     ht->entries = NULL;
     ht->n_entries = 0;
     ht->cap = 0;
     memset(ht->class_n_slots, 0, sizeof(ht->class_n_slots));
-    memset(ht->class_data_off, 0, sizeof(ht->class_data_off));
-    ftruncate(ht->hot_fd, HOT_HDR_TOTAL);
-    ht->file_size = HOT_HDR_TOTAL;
-    update_class_n_slots_on_disk(ht);
+    for (int c = 0; c < HOT_N_CLASSES; c++) {
+        ftruncate(ht->fds[c], HOT_HDR_TOTAL);
+        ht->file_size[c] = HOT_HDR_TOTAL;
+        persist_class_n_slots(ht, c);
+    }
     pthread_mutex_unlock(&ht->mu);
     *out_snap = snap;
     *out_n = n;
