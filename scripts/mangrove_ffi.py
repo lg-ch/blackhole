@@ -334,6 +334,43 @@ def varbyte_decode(data: bytes) -> tuple[int, int]:
     return val, pos.value
 
 
+# ---- Live-ingest medians ----
+# int  mg_live_medians_load(const char* path)   → med_depth or -1
+# void mg_live_medians_clear(void)
+# int  mg_live_medians_depth(void)              → 0 when not loaded
+_lib.mg_live_medians_load.argtypes  = [c_char_p]
+_lib.mg_live_medians_load.restype   = c_int
+_lib.mg_live_medians_clear.argtypes = []
+_lib.mg_live_medians_clear.restype  = None
+_lib.mg_live_medians_depth.argtypes = []
+_lib.mg_live_medians_depth.restype  = c_int
+
+
+def load_live_medians(index_dir: str) -> int:
+    """Arm the stateless traversal helpers (traverse_sub & co — the live
+    insert routing path) with the index's frozen median thresholds.
+
+    On a median-built index this MUST be called before routing inserts,
+    otherwise docs are routed sign-split and land in leaves the query
+    never visits (stranded). Returns med_depth, or 0 if the index has no
+    medians.bin (classic index — sign splits, nothing to arm)."""
+    path = os.path.join(index_dir, 'medians.bin')
+    if not os.path.exists(path):
+        return 0
+    md = _lib.mg_live_medians_load(path.encode())
+    if md < 0:
+        raise RuntimeError(f'medians.bin unreadable: {path}')
+    return md
+
+
+def clear_live_medians() -> None:
+    _lib.mg_live_medians_clear()
+
+
+def live_medians_depth() -> int:
+    return _lib.mg_live_medians_depth()
+
+
 def traverse_sub(qvec: np.ndarray, sub_dim: int, depth: int, tree_idx: int) -> int:
     if qvec.dtype != np.float32: qvec = qvec.astype(np.float32)
     if not qvec.flags['C_CONTIGUOUS']: qvec = np.ascontiguousarray(qvec)
