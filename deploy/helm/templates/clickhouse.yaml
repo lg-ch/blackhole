@@ -1,0 +1,137 @@
+{{- if .Values.clickhouse.enabled }}
+# Optional ClickHouse sidecar for metadata filtering.
+#
+# In the mangrove architecture ClickHouse is a CLIENT-side dependency : the
+# SDK's ClickHouseSink (clickhouse-connect, HTTP 8123) builds a doc_id bitmap
+# from a `where=` clause and ships it to the search node as `allowed_bitmap`.
+# The mangrove server itself never connects here. We still ship it in-chart so
+# a single `helm install` yields a self-contained, filter-capable stack.
+#
+# Single replica, MergeTree on a PVC. NOT an HA ClickHouse — for production
+# metadata at scale, point the SDK at an external managed ClickHouse instead
+# and set clickhouse.enabled=false.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "mangrove.fullname" . }}-clickhouse
+  labels:
+    {{- include "mangrove.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+spec:
+  serviceName: {{ include "mangrove.fullname" . }}-clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      # Independent identity: name=<base>-clickhouse so the mangrove Service
+      # selector (name=<base>, instance=<release>) does NOT cross-match this
+      # pod. Sharing the bare selectorLabels would put ClickHouse into the
+      # mangrove Service's endpoint set and round-robin search traffic to it.
+      app.kubernetes.io/name: {{ include "mangrove.name" . }}-clickhouse
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "mangrove.name" . }}-clickhouse
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: clickhouse
+    spec:
+      containers:
+        - name: clickhouse
+          image: "{{ .Values.clickhouse.image.repository }}:{{ .Values.clickhouse.image.tag }}"
+          imagePullPolicy: {{ .Values.clickhouse.image.pullPolicy }}
+          env:
+            # Let the `default` user connect with no password (the SDK sink's
+            # default credentials). Override for anything internet-facing.
+            - name: CLICKHOUSE_SKIP_USER_SETUP
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /?query=SELECT+1
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.clickhouse.resources | nindent 12 }}
+          volumeMounts:
+            - name: ch-data
+              mountPath: /var/lib/clickhouse
+            {{- if .Values.clickhouse.initSql }}
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            {{- end }}
+      {{- if or .Values.clickhouse.initSql (not .Values.clickhouse.persistence.enabled) }}
+      volumes:
+        {{- if not .Values.clickhouse.persistence.enabled }}
+        - name: ch-data
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.clickhouse.initSql }}
+        - name: init
+          configMap:
+            name: {{ include "mangrove.fullname" . }}-clickhouse-init
+        {{- end }}
+      {{- end }}
+  {{- if .Values.clickhouse.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: ch-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.clickhouse.persistence.storageClass }}
+        storageClassName: {{ .Values.clickhouse.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.clickhouse.persistence.size }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mangrove.fullname" . }}-clickhouse
+  labels:
+    {{- include "mangrove.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8123
+      targetPort: http
+      protocol: TCP
+      name: http
+    - port: 9000
+      targetPort: native
+      protocol: TCP
+      name: native
+  selector:
+    app.kubernetes.io/name: {{ include "mangrove.name" . }}-clickhouse
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: clickhouse
+{{- if .Values.clickhouse.initSql }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mangrove.fullname" . }}-clickhouse-init
+  labels:
+    {{- include "mangrove.labels" . | nindent 4 }}
+    app.kubernetes.io/component: clickhouse
+data:
+  01-init.sql: |
+{{ .Values.clickhouse.initSql | indent 4 }}
+{{- end }}
+{{- end }}

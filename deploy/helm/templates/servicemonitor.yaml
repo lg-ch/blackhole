@@ -1,0 +1,20 @@
+{{- if .Values.prometheus.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "mangrove.fullname" . }}
+  namespace: {{ .Values.prometheus.serviceMonitor.namespace }}
+  labels:
+    {{- include "mangrove.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "mangrove.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.prometheus.serviceMonitor.interval }}
+{{- end }}

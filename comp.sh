@@ -1,0 +1,19 @@
+EXCLUDES=(                                                                                                                                                                                 
+    --exclude='mangrove-search/datasets/*'                                                                                                                                                   
+    --exclude='mangrove-search/index*'                                                                                                                                                       
+    --exclude='mangrove-search/f100_*'                                                                                                                                                       
+    --exclude='mangrove-search/bigann_base.bvecs'                                                                                                                                            
+    --exclude='mangrove-search/clickhouse/data'                                                                                                                                              
+    --exclude='mangrove-search/clickhouse/clickhouse'                                                                                                                                        
+    --exclude='mangrove-search/*.log'                                                                                                                                                        
+    --exclude='mangrove-search/perf.data'                                                                                                                                                    
+    --exclude='mangrove-search/rpforest'                                                                                                                                                     
+    --exclude='mangrove-search/libmangrove.so'                                                                                                                                               
+    --exclude='mangrove-search/src/*.o'                                                                                                                                                      
+    --exclude='mangrove-search/__pycache__'                                                                                                                                                  
+    --exclude='mangrove-search/build'                                                                                                                                                        
+    --exclude='mangrove-search/bench/output'
+    --exclude='mangrove-search/R&D/*'
+    --exclude='mangrove-search/sift/*'
+  )                                                                                                                                                                                          
+  tar czvf ~/mangrove-repo.tar.gz -C /home/chatelet "${EXCLUDES[@]}" mangrove-search

@@ -1,0 +1,43 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.pyc
+__pycache__/
+.pytest_cache/
+
+# Python venvs
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# Large data files
+*.bvecs
+*.fvecs
+*.ivecs
+build*.log
+site/
+
+# Private working docs (funding applications, business strategy, etc.)
+funding/
+R&D/
+deployment/
+
+# --- BLACKHOLE-GUARD: artefacts de build & données lourdes ---
+*.o
+*.so
+rpforest
+*.tar
+*.tar.gz
+*.tgz
+*.bin
+transfer/
+datasets/
+.claude/

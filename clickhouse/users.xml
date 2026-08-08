@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <users>
+        <default>
+            <password></password>
+            <networks><ip>::1</ip><ip>127.0.0.1</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+    <profiles>
+        <default>
+            <max_memory_usage>8000000000</max_memory_usage>
+        </default>
+    </profiles>
+    <quotas>
+        <default><interval><duration>3600</duration></interval></default>
+    </quotas>
+</clickhouse>

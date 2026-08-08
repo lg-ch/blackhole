@@ -1,0 +1,85 @@
+site_name: mangrove-search
+site_description: Cold-storage massive multi-index ANN vector search
+site_author: Leo Chartier
+site_url: https://leo_chartier.gitlab.io/mangrove-search/
+
+repo_name: leo_chartier/mangrove-search
+repo_url:  https://gitlab.com/leo_chartier/mangrove-search
+edit_uri:  -/edit/master/
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: cyan
+      accent:  cyan
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: cyan
+      accent:  cyan
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  icon:
+    repo: fontawesome/brands/gitlab
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/gitlab
+      link: https://gitlab.com/leo_chartier/mangrove-search
+
+nav:
+  - Home: index.md
+  - Quickstart: QUICKSTART.md
+  - Python SDK: SDK.md
+  - Comparison: COMPARISON.md
+  - Architecture: ARCHITECTURE.md
+  - Benchmarks: BENCH.md
+  - Operations:
+      - Runbook: RUNBOOK.md
+      - Setup: SETUP.md
+      - Platforms: PLATFORMS.md
+      - HA deployment: HA.md
+      - Auth & OIDC: AUTH.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - footnotes
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+
+plugins:
+  - search

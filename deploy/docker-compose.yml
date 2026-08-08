@@ -1,0 +1,91 @@
+# Full mangrove-search stack with ClickHouse for metadata filtering,
+# Prometheus for metrics, and Grafana for dashboards. Single
+# `docker compose up` brings everything up locally for dev/demo.
+#
+# Production : use the Helm chart in deploy/helm/ instead.
+
+services:
+
+  mangrove:
+    image: registry.gitlab.com/leo_chartier/mangrove-search:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command:
+      - python3
+      - /opt/mangrove/scripts/serve_cluster.py
+      - --root
+      - /data
+      - --port
+      - "8000"
+    environment:
+      MG_API_KEYS: ${MG_API_KEYS:-}     # e.g. "ops:secret::admin:0"
+    ports:
+      - "8000:8000"
+    volumes:
+      - mangrove_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: 1
+    ports:
+      - "8123:8123"     # HTTP
+      - "9000:9000"     # Native
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/?query=SELECT+1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+    depends_on:
+      - mangrove
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana-provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  mangrove_data:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:

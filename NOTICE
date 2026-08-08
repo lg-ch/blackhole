@@ -1,0 +1,15 @@
+mangrove-search
+Copyright 2026 Leo Chartier
+
+This product includes software developed at Leo Chartier (leochartier.org).
+
+Third-party software included or required at runtime :
+
+- liburing       — MIT License,    https://github.com/axboe/liburing
+- CRoaring       — Apache 2.0,     https://github.com/RoaringBitmap/CRoaring
+- xxHash         — BSD 2-Clause,   https://github.com/Cyan4973/xxHash
+- OpenMP runtime — depends on the compiler (GCC libgomp = GPL-with-exception
+                   or LLVM OpenMP = Apache 2.0)
+
+The included Python SDK depends on numpy (BSD 3-Clause). HTMX is loaded
+from the unpkg CDN in the management UI (BSD 2-Clause).

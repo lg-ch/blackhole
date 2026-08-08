@@ -1,0 +1,137 @@
+# Mangrove-search CI pipeline.
+#
+# Stages :
+#   1. build   — compile rpforest + libmangrove.so (debug + release)
+#   2. test    — run C unit tests (tests/test_core.py) and Python tests
+#   3. docker  — build the runtime image (manual, only on tags/master)
+#
+# Runs on the shared GitLab runners (Docker executor) ; uses Debian
+# bookworm-slim for compatibility with the runtime Dockerfile.
+
+variables:
+  DEBIAN_FRONTEND: noninteractive
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+stages:
+  - build
+  - test
+  - docker
+  - pages
+
+.deps-template: &install_deps
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends
+        gcc make pkg-config
+        libroaring-dev liburing-dev libxxhash-dev libomp-dev
+        python3 python3-numpy python3-pip
+        wget ca-certificates
+    - pip3 install --break-system-packages pyarrow pytest urllib3
+
+# ----------------------------------------------------------------
+# 1. Build
+# ----------------------------------------------------------------
+build:release:
+  stage: build
+  image: debian:bookworm-slim
+  <<: *install_deps
+  script:
+    - make clean
+    - make
+    - ls -la rpforest libmangrove.so
+    # Smoke : ensure binary links + runs. rpforest with no args exits
+    # non-zero (prints usage) ; with `pipefail` on, `| head` would
+    # propagate. We swallow non-zero deliberately — the smoke is "did
+    # it not segfault", not "did it succeed".
+    - "set +o pipefail; ./rpforest 2>&1 | head -5; true"
+  artifacts:
+    paths:
+      - rpforest
+      - libmangrove.so
+    expire_in: 1 day
+
+# ----------------------------------------------------------------
+# 2. Test
+# ----------------------------------------------------------------
+test:core:
+  stage: test
+  image: debian:bookworm-slim
+  needs: ["build:release"]
+  <<: *install_deps
+  script:
+    - python3 tests/test_core.py
+  # 20 unit tests on varbyte / traverse_continue / srt_hash / tombstones
+
+test:liveindex:
+  stage: test
+  image: debian:bookworm-slim
+  needs: ["build:release"]
+  <<: *install_deps
+  script:
+    # Pull the tiny SIFT 1M subset for end-to-end tests (already small,
+    # ~500 MB). Skip if a cached artifact exists.
+    - mkdir -p sift && cd sift
+    - test -f sift_base.fvecs ||
+        (wget -q ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz &&
+         tar xf sift.tar.gz --strip-components=1)
+    - cd ..
+    # crash recovery + autostore + memleak (short)
+    - python3 scripts/test_crash_recovery.py
+    - python3 scripts/test_live_autostore.py
+    - python3 scripts/test_memleak.py --duration 60 --sample 10 --port 8911
+  artifacts:
+    when: on_failure
+    paths:
+      - logs/
+    expire_in: 1 week
+  after_script:
+    - mkdir -p logs && cp /tmp/memleak_serve.log /tmp/serve_live*.log logs/ 2>/dev/null || true
+
+# ----------------------------------------------------------------
+# 3. Docker (manual, only on master / tags)
+# ----------------------------------------------------------------
+docker:build:
+  stage: docker
+  image: docker:24
+  services:
+    - docker:24-dind
+  needs: ["test:core"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+    IMAGE: $CI_REGISTRY_IMAGE
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $IMAGE:$CI_COMMIT_SHORT_SHA .
+    - docker tag $IMAGE:$CI_COMMIT_SHORT_SHA $IMAGE:latest
+    - docker push $IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker push $IMAGE:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: manual
+    - if: '$CI_COMMIT_TAG'
+      when: manual
+
+# ----------------------------------------------------------------
+# 4. GitLab Pages — render the markdown docs as a static site
+#    via MkDocs Material. Published at
+#    https://leo_chartier.gitlab.io/mangrove-search/
+# ----------------------------------------------------------------
+pages:
+  stage: pages
+  image: python:3.12-slim
+  # Pages doesn't depend on build/test/docker — it only renders .md files.
+  # `needs: []` makes it run in parallel with the build stage, ASAP.
+  needs: []
+  before_script:
+    - pip install --no-cache-dir
+        "mkdocs-material>=9.5"
+        "mkdocs-exclude>=1.0.2"
+  script:
+    - mkdocs build --strict
+    - mv site public      # GitLab Pages expects the build in ./public
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'

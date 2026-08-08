@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'mangrove'
+    static_configs:
+      - targets: ['mangrove:8000']
+
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse:9363']  # CH built-in Prometheus endpoint

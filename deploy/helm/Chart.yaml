@@ -1,0 +1,12 @@
+apiVersion: v2
+name: mangrove-search
+description: Mangrove ANN vector search — multi-index streaming engine
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://gitlab.com/leo_chartier/mangrove-search
+sources:
+  - https://gitlab.com/leo_chartier/mangrove-search
+maintainers:
+  - name: Leo Chartier
+    email: chartier.lg@gmail.com

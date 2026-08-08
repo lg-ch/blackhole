@@ -1,0 +1,101 @@
+# Default values for mangrove-search.
+image:
+  repository: registry.gitlab.com/leo_chartier/mangrove-search
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# How many serve_cluster replicas. Each owns its own storage (StatefulSet)
+# so replicas DO NOT share data — use replication: enabled for that.
+replicas: 1
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    memory: "512Mi"
+    cpu: "1"
+  limits:
+    memory: "2Gi"      # 2x expected peak — tune to your dim × n_trees
+    cpu: "4"
+
+persistence:
+  enabled: true
+  storageClass: ""     # empty = cluster default. Prefer block storage
+                       # (EBS gp3 / GCP PD SSD) over NFS for the build path.
+  size: 100Gi
+
+# Per-key auth ; passed via a Secret + env. See README and serve_cluster docs.
+# Format: 'label:key:pattern,pattern:perms:qps' comma-separated.
+auth:
+  enabled: false
+  # Set this in your own values override OR mount via existingSecret.
+  keys: ""
+  existingSecret: ""
+
+# Liveness / readiness over /health (public endpoint).
+probes:
+  liveness:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+
+# Optional ingress (front with TLS-terminating reverse proxy for prod).
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: mangrove.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+prometheus:
+  serviceMonitor:
+    enabled: false
+    namespace: monitoring
+    interval: 15s
+
+# Optional in-chart ClickHouse for metadata filtering. ClickHouse is a
+# CLIENT-side dependency (the SDK's ClickHouseSink talks to it directly over
+# 8123) — the mangrove server never connects here. Enable for a self-contained
+# filter-capable stack; disable and point the SDK at a managed ClickHouse for
+# production-scale metadata.
+clickhouse:
+  enabled: true
+  image:
+    repository: clickhouse/clickhouse-server
+    tag: "25.3"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "2"
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 20Gi
+  # Optional SQL run once at first boot (docker-entrypoint-initdb.d). The SDK
+  # sink auto-creates docs_metadata on first insert, so this is just a nicety
+  # for pre-seeding the schema. Set to "" to skip.
+  initSql: |
+    CREATE TABLE IF NOT EXISTS docs_metadata (
+        doc_id    UInt32,
+        ts        DateTime64(3) DEFAULT now64(),
+        category  LowCardinality(String),
+        region    LowCardinality(String),
+        lang      LowCardinality(String)
+    ) ENGINE = MergeTree
+    ORDER BY (ts, doc_id);

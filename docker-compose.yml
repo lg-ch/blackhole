@@ -1,0 +1,63 @@
+version: "3.9"
+
+# mangrove-search dev stack: search node + ClickHouse + Prometheus + Grafana.
+# For prod, separate the build node (large RAM/CPU for build_forest) from the
+# query nodes (small RAM, fast SSD). See ROADMAP_10D.md "P0 J9 separation".
+
+services:
+  mangrove:
+    build: .
+    image: mangrove-search:dev
+    container_name: mangrove
+    volumes:
+      - ./datasets:/data
+      - ./indexes:/indexes
+    environment:
+      - OMP_NUM_THREADS=8
+    # Override the entrypoint to run an interactive shell or a long-lived
+    # Python orchestrator. The C binary is at /opt/mangrove/rpforest.
+    command: ["topn", "/data/sift_query.fvecs", "/data/sift_groundtruth.ivecs",
+              "/data/sift_base.fvecs", "/indexes/sift1m", "1000", "25",
+              "1000000", "10", "500", "10"]
+    depends_on:
+      - clickhouse
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: mangrove-ch
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    ports:
+      - "9000:9000"  # native TCP (used by clickhouse-driver in scripts/)
+      - "8123:8123"  # HTTP (debugging only)
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/local.xml:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/local.xml:ro
+
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: mangrove-prom
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: mangrove-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Editor
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  ch_data:
+  prom_data:
+  grafana_data:
