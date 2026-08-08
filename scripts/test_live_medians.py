@@ -13,7 +13,11 @@ that doc's vector to.
   1. WITHOUT load_live_medians : mismatch expected (demonstrates the bug)
   2. WITH    load_live_medians : exact parity  (validates the fix)
   3. probes_scored main path == traverse_sub  (insert ↔ query coherent)
-  4. classic index (no medians.bin), helpers unarmed : exact parity
+  4. FULL live chain on the median index : route (medians armed) →
+     hot_append → query_pathrank finds the doc. Negative control : docs
+     routed sign-split (medians cleared) into the same overlay stay
+     invisible to the query — the exact production failure mode.
+  5. classic index (no medians.bin), helpers unarmed : exact parity
      (guards the default sign-split path against regression)
 
 Cheap on purpose : 20k docs, dim 64, 8 trees, depth 10 — runs in seconds,
@@ -45,10 +49,21 @@ GEN_V     = 3
 SAMPLE_N  = 5_000
 N_CHECK   = 400          # docs sampled for the parity checks
 
-# test-only binding (not in mangrove_ffi's public surface)
+# test-only bindings (not in mangrove_ffi's public surface)
+from ctypes import c_void_p, c_uint32                       # noqa: E402
 mf._lib.mg_calibrate_medians.argtypes = [c_char_p, c_char_p, c_int, c_int,
                                          c_int, c_int, c_int]
 mf._lib.mg_calibrate_medians.restype = c_int
+mf._lib.mg_hot_init.argtypes   = [c_int, c_int, c_char_p]
+mf._lib.mg_hot_init.restype    = c_void_p
+mf._lib.mg_hot_free.argtypes   = [c_void_p]
+mf._lib.mg_hot_free.restype    = None
+mf._lib.mg_hot_append.argtypes = [c_void_p, c_int, c_uint32, c_uint32]
+mf._lib.mg_hot_append.restype  = c_int
+mf._lib.mg_forest_set_hot_overlay.argtypes = [c_void_p]
+mf._lib.mg_forest_set_hot_overlay.restype  = None
+mf._lib.mg_hot_compact_all.argtypes = [c_void_p, c_void_p, c_char_p]
+mf._lib.mg_hot_compact_all.restype  = c_int
 
 
 def make_vecs(n, dim, seed):
@@ -150,6 +165,60 @@ def main():
                   != insert_leaf(new[i], t))
         print(f'[3] insert path vs query main path : {bad} / '
               f'{len(new) * N_TREES} disagreements')
+
+        # ---------- full live chain : hot insert → query ----------
+        hotdir = os.path.join(tmp, 'hot')
+        os.makedirs(hotdir, exist_ok=True)
+        hot = mf._lib.mg_hot_init(N_TREES, DEPTH, hotdir.encode())
+        assert hot, 'mg_hot_init failed'
+        mf._lib.mg_forest_set_hot_overlay(hot)
+
+        def hot_insert(vec, doc_id):
+            for t in range(N_TREES):
+                rc = mf._lib.mg_hot_append(hot, t, insert_leaf(vec, t), doc_id)
+                assert rc == 0
+
+        def doc_votes(vec, doc_id):
+            """Votes for doc_id on the main-path-only query (n_probes=0) :
+            8/8 = every tree's query leaf holds the doc, i.e. perfectly
+            reachable ; low votes = mostly stranded (at scale, low-vote
+            candidates don't survive the top_n cut)."""
+            ids, votes, n = f.query_pathrank(vec, 0, N_TREES, 500,
+                                             query_depth=DEPTH)
+            for j in range(n):
+                if int(ids[j]) == doc_id:
+                    return int(votes[j])
+            return 0
+
+        live = make_vecs(100, DIM, seed=999)
+        assert mf.live_medians_depth() == MED_DEPTH
+        for i in range(100):
+            hot_insert(live[i], N_DOCS + i)          # routed WITH medians
+        v_live = [doc_votes(live[i], N_DOCS + i) for i in range(100)]
+        n_full = sum(1 for v in v_live if v == N_TREES)
+        print(f'[4] hot insert → query, medians armed : mean votes '
+              f'{np.mean(v_live):.1f}/{N_TREES}, {n_full}/100 docs at '
+              f'{N_TREES}/{N_TREES}, found {sum(1 for v in v_live if v)}/100')
+
+        ghost = make_vecs(100, DIM, seed=31337)
+        mf.clear_live_medians()                      # simulate the old bug
+        for i in range(100):
+            hot_insert(ghost[i], N_DOCS + 1000 + i)  # routed sign-split
+        mf.load_live_medians(idir)
+        v_ghost = [doc_votes(ghost[i], N_DOCS + 1000 + i) for i in range(100)]
+        print(f'[4b] same, routed sign-split (old bug): mean votes '
+              f'{np.mean(v_ghost):.1f}/{N_TREES} (stranded)')
+
+        # compaction : drain HOT into the main SRTs, requery from MAIN
+        rc = mf._lib.mg_hot_compact_all(f._h, hot, idir.encode())
+        assert rc == 0, f'mg_hot_compact_all rc={rc}'
+        mf._lib.mg_forest_set_hot_overlay(None)      # HOT drained + detached
+        v_post = [doc_votes(live[i], N_DOCS + i) for i in range(100)]
+        print(f'[4c] after compaction (HOT drained)  : mean votes '
+              f'{np.mean(v_post):.1f}/{N_TREES}, found '
+              f'{sum(1 for v in v_post if v)}/100 from MAIN')
+
+        mf._lib.mg_hot_free(hot)
         f.close()
 
         # ---------- classic index (regression guard) ----------
@@ -160,10 +229,12 @@ def main():
         f2 = Forest(idir2, n_trees=N_TREES, dim=DIM, sub_dim=SUB_DIM,
                     depth=DEPTH, n_docs=N_DOCS, gen_version=GEN_V)
         pct_classic = parity(f2, vecs, check_ids)
-        print(f'[4] classic index, unarmed         : {pct_classic:5.1f}% mismatch')
+        print(f'[5] classic index, unarmed         : {pct_classic:5.1f}% mismatch')
         f2.close()
 
         ok = (pct_off > 5.0 and pct_on < 0.5 and bad == 0
+              and np.mean(v_live) > N_TREES - 0.5 and np.mean(v_ghost) < 4.0
+              and np.mean(v_post) > N_TREES - 0.5
               and pct_classic < 0.5)
         print('PASS' if ok else 'FAIL')
         return 0 if ok else 1
