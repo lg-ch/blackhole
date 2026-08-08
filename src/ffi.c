@@ -1029,6 +1029,52 @@ unsigned int mg_varbyte_decode(const unsigned char* in, size_t* pos) {
     return (unsigned int)varbyte_decode_u32(in, pos);
 }
 
+/* ---- Live-ingest medians (process-global, load-once) ----
+   The stateless traversal helpers below run without a Forest handle, so
+   they cannot reach f->medians. On a median-built index they would route
+   in pure sign-split (θ=0) → a live-inserted doc lands in a leaf the
+   query never visits (stranded). The live table gives them the same
+   frozen thresholds as build and query. Not loaded = classic sign splits.
+   Load once before ingest traffic; an old table is intentionally leaked
+   on reload because in-flight traversals on other threads may still read
+   it (bounded: one table per reload, ~4-16 MB). */
+static const float* g_live_med       = NULL;
+static int          g_live_med_depth = 0;
+static int          g_live_med_trees = 0;
+
+int mg_live_medians_load(const char* path) {
+    int nt = 0, md = 0;
+    float* tab = medians_load(path, &nt, &md);
+    if (!tab) return -1;
+    g_live_med_depth = md;
+    g_live_med_trees = nt;
+    g_live_med       = tab;
+    return md;
+}
+
+void mg_live_medians_clear(void) {
+    g_live_med = NULL;
+    g_live_med_depth = 0;
+    g_live_med_trees = 0;
+}
+
+int mg_live_medians_depth(void) { return g_live_med ? g_live_med_depth : 0; }
+
+/* Arm the thread-local median table for `tree_idx` — or explicitly reset
+   it to NULL. The reset matters even without a live table : the previous
+   caller on this thread (e.g. a query) may have left another tree's
+   thresholds armed. */
+static inline void live_set_medians(int tree_idx) {
+    const float* t = g_live_med;
+    if (t && tree_idx >= 0 && tree_idx < g_live_med_trees) {
+        traversal_set_medians(
+            t + (size_t)tree_idx * ((1u << g_live_med_depth) - 1),
+            g_live_med_depth);
+    } else {
+        traversal_set_medians(NULL, 0);
+    }
+}
+
 /* Run traverse_sub(qvec, dim, sub_dim, depth, tree_seed(tree_idx)).
    Returns the global node id at `depth`. */
 int mg_traverse_sub(const float* qvec, int dim, int sub_dim,
@@ -1036,6 +1082,7 @@ int mg_traverse_sub(const float* qvec, int dim, int sub_dim,
     float v0[1024], v1[1024];
     int dims[256];
     if (sub_dim > 256 || dim > 1024) return -1;
+    live_set_medians(tree_idx);
     return (int)traverse_sub(qvec, dim, sub_dim, depth, tree_seed(tree_idx),
                               v0, v1, dims);
 }
@@ -1048,6 +1095,7 @@ int mg_trace_margins(const float* qvec, int dim, int sub_dim, int depth,
     float v0[1024], v1[1024];
     int dims[256];
     if (sub_dim > 256 || dim > 1024 || depth > 64) return -1;
+    live_set_medians(tree_idx);
     return (int)traverse_sub_trace(qvec, dim, sub_dim, depth,
                                     tree_seed(tree_idx),
                                     v0, v1, dims, out_margins);
@@ -1064,6 +1112,7 @@ int mg_query_probes_scored(const float* qvec, int dim, int sub_dim, int depth,
     float v0[1024], v1[1024];
     int dims[256];
     if (sub_dim > 256 || dim > 1024 || depth > 64) return -1;
+    live_set_medians(tree_idx);
     int32_t nodes[64];
     int cnt = traverse_sub_probes_scored(qvec, dim, sub_dim, depth,
                                           tree_seed(tree_idx),
@@ -1162,6 +1211,7 @@ int mg_traverse_sub_continue(const float* qvec, int dim, int sub_dim,
     float v0[1024], v1[1024];
     int dims[256];
     if (sub_dim > 256 || dim > 1024) return -1;
+    live_set_medians(tree_idx);
     return (int)traverse_sub_continue(qvec, dim, sub_dim,
                                        start_depth, n_extra,
                                        (int32_t)start_node,
