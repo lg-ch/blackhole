@@ -371,6 +371,30 @@ def live_medians_depth() -> int:
     return _lib.mg_live_medians_depth()
 
 
+# int mg_traverse_all_trees(qvec, dim, sub_dim, depth, n_trees, out_leaves)
+_lib.mg_traverse_all_trees.argtypes = [POINTER(c_float), c_int, c_int,
+                                       c_int, c_int, POINTER(c_int32)]
+_lib.mg_traverse_all_trees.restype = c_int
+
+
+def traverse_all_trees(qvec: np.ndarray, sub_dim: int, depth: int,
+                       n_trees: int) -> np.ndarray:
+    """Leaf ids d'UN vecteur sur les n_trees arbres en un seul appel FFI
+    (médianes live appliquées si chargées). C'est le chemin de routage
+    d'insert batché — ~100× moins d'overhead FFI que n_trees appels."""
+    if qvec.dtype != np.float32:
+        qvec = qvec.astype(np.float32)
+    if not qvec.flags['C_CONTIGUOUS']:
+        qvec = np.ascontiguousarray(qvec)
+    out = np.empty(n_trees, dtype=np.int32)
+    rc = _lib.mg_traverse_all_trees(
+        qvec.ctypes.data_as(POINTER(c_float)), len(qvec), sub_dim,
+        depth, n_trees, out.ctypes.data_as(POINTER(c_int32)))
+    if rc != 0:
+        raise ValueError('mg_traverse_all_trees failed')
+    return out
+
+
 def traverse_sub(qvec: np.ndarray, sub_dim: int, depth: int, tree_idx: int) -> int:
     if qvec.dtype != np.float32: qvec = qvec.astype(np.float32)
     if not qvec.flags['C_CONTIGUOUS']: qvec = np.ascontiguousarray(qvec)

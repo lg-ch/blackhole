@@ -1087,6 +1087,32 @@ int mg_traverse_sub(const float* qvec, int dim, int sub_dim,
                               v0, v1, dims);
 }
 
+/* Route ONE vector through trees [0..n_trees) in a single call — the
+   batched live-insert routing path (256 individual mg_traverse_sub FFI
+   round-trips capped Python-side ingest at ~90 vec/s). Applies the live
+   medians table per tree, same guarantees as mg_traverse_sub. Writes the
+   LEAF ids (node - (2^depth - 1)) into out_leaves[n_trees].
+   OMP-parallel over trees. Returns 0, or -1 on bad args. */
+int mg_traverse_all_trees(const float* qvec, int dim, int sub_dim,
+                          int depth, int n_trees, int32_t* out_leaves) {
+    if (!qvec || !out_leaves || sub_dim > 256 || dim > 1024 ||
+        depth <= 0 || depth > 30 || n_trees <= 0) return -1;
+    const int32_t lbase = (1 << depth) - 1;
+    #pragma omp parallel
+    {
+        float v0[1024], v1[1024];
+        int dims[256];
+        #pragma omp for schedule(static)
+        for (int t = 0; t < n_trees; t++) {
+            live_set_medians(t);
+            out_leaves[t] = (int32_t)traverse_sub(qvec, dim, sub_dim, depth,
+                                                  tree_seed(t),
+                                                  v0, v1, dims) - lbase;
+        }
+    }
+    return 0;
+}
+
 /* Trace path margins : returns the leaf id AND writes the per-level
    |c1 - c0| margins into out_margins (caller-allocated, size depth).
    Pure CPU work (no disk reads) — meant for per-tree quality scoring. */
