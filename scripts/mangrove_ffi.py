@@ -371,6 +371,52 @@ def live_medians_depth() -> int:
     return _lib.mg_live_medians_depth()
 
 
+# int mg_traverse_batch(vecs, n_vecs, dim, sub_dim, depth, n_trees, out)
+_lib.mg_traverse_batch.argtypes = [POINTER(c_float), c_int, c_int, c_int,
+                                   c_int, c_int, POINTER(c_int32)]
+_lib.mg_traverse_batch.restype = c_int
+# int mg_hot_append_block(hot, leaves, doc_ids, n_vecs, n_trees)
+_lib.mg_hot_append_block.argtypes = [c_void_p, POINTER(c_int32),
+                                     POINTER(c_uint32), c_int, c_int]
+_lib.mg_hot_append_block.restype = c_int
+
+
+def traverse_batch(vecs: np.ndarray, sub_dim: int, depth: int,
+                   n_trees: int) -> np.ndarray:
+    """Leaf ids d'un BLOC de vecteurs (n, dim) sur les n_trees arbres en un
+    seul appel FFI, OMP sur les vecteurs (gros grain — c'est le chemin
+    d'ingest rapide ; traverse_all_trees parallélise sur les arbres, trop
+    fin à faible depth). Retour : int32 (n, n_trees)."""
+    if vecs.dtype != np.float32:
+        vecs = vecs.astype(np.float32)
+    if not vecs.flags['C_CONTIGUOUS']:
+        vecs = np.ascontiguousarray(vecs)
+    n, dim = vecs.shape
+    out = np.empty((n, n_trees), dtype=np.int32)
+    rc = _lib.mg_traverse_batch(
+        vecs.ctypes.data_as(POINTER(c_float)), n, dim, sub_dim,
+        depth, n_trees, out.ctypes.data_as(POINTER(c_int32)))
+    if rc != 0:
+        raise ValueError('mg_traverse_batch failed')
+    return out
+
+
+def hot_append_block(hot_handle, leaves: np.ndarray,
+                     doc_ids: np.ndarray) -> None:
+    """Append d'un bloc routé (sortie de traverse_batch) dans le HOT,
+    parallèle par arbre côté C."""
+    n, n_trees = leaves.shape
+    if leaves.dtype != np.int32:
+        leaves = leaves.astype(np.int32)
+    if doc_ids.dtype != np.uint32:
+        doc_ids = doc_ids.astype(np.uint32)
+    rc = _lib.mg_hot_append_block(
+        hot_handle, leaves.ctypes.data_as(POINTER(c_int32)),
+        doc_ids.ctypes.data_as(POINTER(c_uint32)), n, n_trees)
+    if rc != 0:
+        raise RuntimeError('mg_hot_append_block failed')
+
+
 # int mg_traverse_all_trees(qvec, dim, sub_dim, depth, n_trees, out_leaves)
 _lib.mg_traverse_all_trees.argtypes = [POINTER(c_float), c_int, c_int,
                                        c_int, c_int, POINTER(c_int32)]
