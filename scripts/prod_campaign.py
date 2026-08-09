@@ -157,7 +157,7 @@ def inject_leg(idir, from_doc, to_doc):
     hot = mf._lib.mg_hot_init(NT, depth, hotdir.encode())
     assert hot
     bg = mf._lib.mg_hot_compact_bg_start(f._h, hot, idir.encode(),
-                                         50_000, 200, 3)
+                                         20_000, 50, 3)
     tree_ids = np.arange(NT, dtype=np.int32)
     row_bytes = DIM * 4
     CH = 20_000
@@ -177,7 +177,20 @@ def inject_leg(idir, from_doc, to_doc):
             leaves_blk = mf.traverse_batch(chunk, SD, depth, NT)
             doc_blk = np.arange(from_doc + done, from_doc + done + n,
                                 dtype=np.uint32)
-            mf.hot_append_block(hot, leaves_blk, doc_blk)
+            try:
+                mf.hot_append_block(hot, leaves_blk, doc_blk)
+            except RuntimeError:
+                # BACKPRESSURE : une leaf a dépassé la classe max (256 docs)
+                # avant que le compacteur bg ne passe. Comportement prod :
+                # drain synchrone puis reprise. Le bloc partiellement écrit
+                # est rejoué entier — les doublons se dédupliquent au merge.
+                log(f'  HOT saturé à {done/1e6:.1f}M → drain synchrone...')
+                mf._lib.mg_hot_compact_bg_stop(bg)
+                rc = mf._lib.mg_hot_compact_all(f._h, hot, idir.encode())
+                assert rc == 0, f'compact_all rc={rc}'
+                bg = mf._lib.mg_hot_compact_bg_start(
+                    f._h, hot, idir.encode(), 20_000, 50, 3)
+                mf.hot_append_block(hot, leaves_blk, doc_blk)
             done += n
             if done % 500_000 < CH:
                 rate = done / (time.time() - t0)
