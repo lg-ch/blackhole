@@ -1113,6 +1113,59 @@ int mg_traverse_all_trees(const float* qvec, int dim, int sub_dim,
     return 0;
 }
 
+/* Route a BLOCK of vectors through all trees in one call — OMP over the
+   VECTORS (coarse grain). mg_traverse_all_trees parallélise sur les
+   arbres : à faible depth le fork/join par vecteur domine (~360 vec/s
+   observé en ingest). Ici chaque thread traite des vecteurs entiers →
+   la granularité est n_trees× plus grosse. Layout : out[v*n_trees + t]. */
+int mg_traverse_batch(const float* vecs, int n_vecs, int dim, int sub_dim,
+                      int depth, int n_trees, int32_t* out_leaves) {
+    if (!vecs || !out_leaves || sub_dim > 256 || dim > 1024 ||
+        depth <= 0 || depth > 30 || n_trees <= 0 || n_vecs <= 0) return -1;
+    const int32_t lbase = (1 << depth) - 1;
+    #pragma omp parallel
+    {
+        float v0[1024], v1[1024];
+        int dims[256];
+        #pragma omp for schedule(dynamic, 8)
+        for (int v = 0; v < n_vecs; v++) {
+            const float* q = vecs + (size_t)v * dim;
+            int32_t* out = out_leaves + (size_t)v * n_trees;
+            for (int t = 0; t < n_trees; t++) {
+                live_set_medians(t);
+                out[t] = (int32_t)traverse_sub(q, dim, sub_dim, depth,
+                                               tree_seed(t),
+                                               v0, v1, dims) - lbase;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Append a routed block into the HOT overlay, parallel over TREES (each
+   tree has its own mutex + class files → safe, and the tiny pwrites of
+   n_vecs docs spread across n_trees files instead of serializing).
+   leaves layout : [v * n_trees + t] (la sortie de mg_traverse_batch). */
+int mg_hot_append_block(void* h, const int32_t* leaves,
+                        const uint32_t* doc_ids, int n_vecs, int n_trees) {
+    if (!h || !leaves || !doc_ids || n_vecs <= 0 || n_trees <= 0) return -1;
+    HotOverlay* ho = (HotOverlay*)h;
+    int err = 0;
+    #pragma omp parallel for schedule(dynamic, 4)
+    for (int t = 0; t < n_trees; t++) {
+        if (__atomic_load_n(&err, __ATOMIC_RELAXED)) continue;
+        for (int v = 0; v < n_vecs; v++) {
+            int32_t lf = leaves[(size_t)v * n_trees + t];
+            if (lf < 0 ||
+                hot_append(ho, t, (uint32_t)lf, doc_ids[v]) != 0) {
+                __atomic_store_n(&err, 1, __ATOMIC_RELAXED);
+                break;
+            }
+        }
+    }
+    return err ? -1 : 0;
+}
+
 /* Trace path margins : returns the leaf id AND writes the per-level
    |c1 - c0| margins into out_margins (caller-allocated, size depth).
    Pure CPU work (no disk reads) — meant for per-tree quality scoring. */

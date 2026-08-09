@@ -172,14 +172,12 @@ def inject_leg(idir, from_doc, to_doc):
                                   dtype=np.float32).reshape(n, DIM).copy()
             chunk /= np.maximum(
                 np.linalg.norm(chunk, axis=1, keepdims=True), 1e-12)
-            for i in range(n):
-                leaves = mf.traverse_all_trees(chunk[i], SD, depth, NT)
-                doc = np.full(NT, from_doc + done + i, dtype=np.uint32)
-                rc = mf._lib.mg_hot_append_batch(
-                    hot, tree_ids.ctypes.data_as(POINTER(c_int)),
-                    leaves.astype(np.uint32).ctypes.data_as(POINTER(c_uint32)),
-                    doc.ctypes.data_as(POINTER(c_uint32)), NT)
-                assert rc == 0
+            # routage par bloc (OMP sur les vecteurs) + append parallèle
+            # par arbre : ~10-20× le débit de la boucle vecteur-par-vecteur
+            leaves_blk = mf.traverse_batch(chunk, SD, depth, NT)
+            doc_blk = np.arange(from_doc + done, from_doc + done + n,
+                                dtype=np.uint32)
+            mf.hot_append_block(hot, leaves_blk, doc_blk)
             done += n
             if done % 500_000 < CH:
                 rate = done / (time.time() - t0)

@@ -1417,7 +1417,15 @@ int forest_collect_topn_probes(const Forest* f,
     IdVote* topn_h = (IdVote*)fm->topn_h_buf;
     int topn_size = 0;
 
-    if (allowed == NULL) {
+    /* Le chemin radix ci-dessous est le SEUL à lire le HOT overlay. Avant,
+       tout filtre (bitmap appelant OU tombstones composées dans `allowed`)
+       forçait le chemin curseurs plus bas, aveugle au HOT : les docs
+       insérés en live disparaissaient des recherches filtrées — et une
+       seule tombstone suffisait à tous les cacher. Overlay armé → on reste
+       sur le chemin radix et le bitmap s'applique par doc au scan des
+       votes (post-filtre ; le pré-filtre curseurs reste utilisé sans
+       overlay, où il est optimal pour les filtres épars). */
+    if (allowed == NULL || forest_get_hot_overlay() != NULL) {
         /* RADIX-SORT + LINEAR-SCAN PATH (no filter case).
            Instead of a K-way merge with log K dependent loads per advance,
            gather all (doc, tree) pairs across all leaves into one packed
@@ -1668,6 +1676,15 @@ int forest_collect_topn_probes(const Forest* f,
         int32_t* tree_seen = g_tree_seen_buf;
         for (int t = 0; t < nt; t++) tree_seen[t] = -1;
 
+        /* Filtre appelant (positif) et tombstones (négatif) appliqués
+           SÉPARÉMENT ici : le bitmap composé `flip(tombstones, 0, n_docs)`
+           exclurait les doc_ids live du HOT overlay, qui sont ≥ n_docs
+           par définition (nouveaux docs). */
+        const roaring_bitmap_t* tomb_neg =
+            (f->tombstones &&
+             roaring_bitmap_get_cardinality(f->tombstones) > 0)
+            ? f->tombstones : NULL;
+
         /* Histogram-based top-n pick : one buffer of (doc,vote) + vote
            histogram during the scan, then a single threshold lookup to emit
            the top `top_n`. Replaces the binary-heap topn_push (5 % of total
@@ -1699,6 +1716,8 @@ int forest_collect_topn_probes(const Forest* f,
             }
             uint64_t p = src[i];
             int32_t doc = (int32_t)(p & 0xffffffffu);
+            if (tomb_neg && allowed_contains(tomb_neg, doc)) continue;
+            if (allowed_in && !allowed_contains(allowed_in, doc)) continue;
             int32_t tree = (int32_t)(p >> 32);
             if (doc != prev_doc) {
                 if (prev_doc >= 0) {
