@@ -38,15 +38,23 @@ from qd_calibrate import bench_qd                           # noqa: E402
 from live_drift import bucket_metrics, load_fbin_sample     # noqa: E402
 from ctypes import c_void_p, c_char_p, c_int, c_uint32, POINTER  # noqa: E402
 
-BASE   = os.path.expanduser('~/deep100m/base.fbin')
-QUERIES = os.path.expanduser('~/deep1m/queries.npy')
-ROOT   = os.path.expanduser('~/campaign')
-RPF    = os.path.join(os.path.dirname(HERE), 'rpforest')
+# Chemins surchargables par env (campagne locale WSL vs serveur) :
+#   CAMPAIGN_BASE, CAMPAIGN_QUERIES, CAMPAIGN_ROOT, CAMPAIGN_GT_DIR
+BASE = os.path.expanduser(os.environ.get('CAMPAIGN_BASE',
+                                         '~/deep100m/base.fbin'))
+QUERIES = os.path.expanduser(os.environ.get('CAMPAIGN_QUERIES',
+                                            '~/deep1m/queries.npy'))
+ROOT = os.path.expanduser(os.environ.get('CAMPAIGN_ROOT', '~/campaign'))
+RPF = os.path.join(os.path.dirname(HERE), 'rpforest')
 DIM, SD, NT, GEN = 96, 16, 256, 3
 
-GT = {10: os.path.expanduser('~/deep10m/gt_top10.npy'),
-      20: os.path.expanduser('~/deep100m/gt_20m.npy'),
-      50: os.path.expanduser('~/deep100m/gt_50m.npy')}
+_GTD = os.environ.get('CAMPAIGN_GT_DIR', '')
+if _GTD:
+    GT = {n: os.path.join(_GTD, f'gt_{n}m.npy') for n in (10, 20, 50)}
+else:
+    GT = {10: os.path.expanduser('~/deep10m/gt_top10.npy'),
+          20: os.path.expanduser('~/deep100m/gt_20m.npy'),
+          50: os.path.expanduser('~/deep100m/gt_50m.npy')}
 
 # échelle → (depth build frais, med_depth)
 LADDER = {1: (17, 10), 10: (20, 12), 20: (21, 12), 50: (22, 13)}
@@ -125,10 +133,12 @@ def build_fresh(idir, n_docs, depth, med_depth):
     if not os.path.exists(os.path.join(idir, f'tree{NT-1:05d}.srt')):
         log(f'  bulk build d={depth} sur {n_docs//1_000_000}M docs...')
         t0 = time.time()
+        # PAS de --fast ici : il garde les paires en RAM (32 GB de RSS sur
+        # le serveur 64 GB) — la VM WSL locale n'y survit pas. Le chemin
+        # batché sur disque tient dans quelques GB quelle que soit l'échelle.
         subprocess.run([RPF, 'build', BASE, idir, str(NT), str(depth),
                         '--sub_dim', str(SD), '--gen', f'v{GEN}',
-                        '--dim', str(DIM), '--doc_count', str(n_docs),
-                        '--fast'],
+                        '--dim', str(DIM), '--doc_count', str(n_docs)],
                        check=True, capture_output=True)
         log(f'  build fini en {time.time()-t0:.0f}s')
 
