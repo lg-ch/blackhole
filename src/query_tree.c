@@ -11,12 +11,16 @@
 #include <roaring/roaring.h>
 
 /* CRoaring ≥ 3 a renommé l'API itérateur, et les anciens noms ont été
-   SUPPRIMÉS en 4.x (Ubuntu 24 x86 livre 4.6 → link error). Shim pour
-   compiler contre les deux générations. */
-#if defined(ROARING_VERSION_MAJOR) && ROARING_VERSION_MAJOR >= 3
+   SUPPRIMÉS en 4.x (Ubuntu 24 x86 livre 4.6 → link error). La version
+   n'est pas détectable au préprocesseur (ROARING_VERSION_MAJOR est un
+   enum) ; on discrimine par roaring64.h, introduit en 3.0 pile quand la
+   nouvelle API itérateur est arrivée. */
+#if defined(__has_include)
+#if __has_include(<roaring/roaring64.h>)
 #define roaring_init_iterator(bm, it) roaring_iterator_init((bm), (it))
 #define roaring_move_uint32_iterator_equalorlarger(it, val) \
         roaring_uint32_iterator_move_equalorlarger((it), (val))
+#endif
 #endif
 
 #include <stdio.h>
