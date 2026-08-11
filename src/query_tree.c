@@ -15,7 +15,9 @@
    n'est pas détectable au préprocesseur (ROARING_VERSION_MAJOR est un
    enum) ; on discrimine par roaring64.h, introduit en 3.0 pile quand la
    nouvelle API itérateur est arrivée. */
-#if defined(__has_include)
+/* -DMANGROVE_CROARING_OLD_API force l'ancienne API (build contre une
+   croaring vendorisée alors que des headers système récents traînent). */
+#if !defined(MANGROVE_CROARING_OLD_API) && defined(__has_include)
 #if __has_include(<roaring/roaring64.h>)
 #define roaring_init_iterator(bm, it) roaring_iterator_init((bm), (it))
 #define roaring_move_uint32_iterator_equalorlarger(it, val) \
