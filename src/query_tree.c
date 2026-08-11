@@ -10,6 +10,15 @@
 
 #include <roaring/roaring.h>
 
+/* CRoaring ≥ 3 a renommé l'API itérateur, et les anciens noms ont été
+   SUPPRIMÉS en 4.x (Ubuntu 24 x86 livre 4.6 → link error). Shim pour
+   compiler contre les deux générations. */
+#if defined(ROARING_VERSION_MAJOR) && ROARING_VERSION_MAJOR >= 3
+#define roaring_init_iterator(bm, it) roaring_iterator_init((bm), (it))
+#define roaring_move_uint32_iterator_equalorlarger(it, val) \
+        roaring_uint32_iterator_move_equalorlarger((it), (val))
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/uio.h>           /* struct iovec for io_uring_register_buffers */
