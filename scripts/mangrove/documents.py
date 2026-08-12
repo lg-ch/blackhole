@@ -83,14 +83,18 @@ class DocumentStore:
         self.state.setdefault('chunk_overlap', chunk_overlap)
         # doc_map en RAM : petit (1 entrée/document, pas par chunk)
         self.docs: dict[str, dict] = {}
+        self._key_by_id: dict[int, str] = {}
         if os.path.exists(self._paths['doc_map.jsonl']):
             with open(self._paths['doc_map.jsonl']) as fh:
                 for line in fh:
                     rec = json.loads(line)
                     if rec.get('deleted'):
-                        self.docs.pop(rec['key'], None)
+                        old = self.docs.pop(rec['key'], None)
+                        if old:
+                            self._key_by_id.pop(old['doc_id'], None)
                     else:
                         self.docs[rec['key']] = rec
+                        self._key_by_id[rec['doc_id']] = rec['key']
         if not os.path.exists(self._paths['vecs.fbin']):
             with open(self._paths['vecs.fbin'], 'wb') as fh:
                 fh.write(struct.pack('<ii', 0, dim))
@@ -187,6 +191,7 @@ class DocumentStore:
         with open(self._paths['doc_map.jsonl'], 'a') as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
         self.docs[key] = rec
+        self._key_by_id[doc_id] = key
         self.state['next_chunk_id'] = int(c0 + n)
         self.state['next_doc_id'] = doc_id + 1
         self._save_state()
@@ -202,6 +207,7 @@ class DocumentStore:
         with open(self._paths['doc_map.jsonl'], 'a') as fh:
             fh.write(json.dumps({'deleted': True, 'key': key}) + '\n')
         del self.docs[key]
+        self._key_by_id.pop(rec['doc_id'], None)
         return rec['n_chunks']
 
     def search(self, text: str | None = None, qvec=None,
@@ -248,10 +254,9 @@ class DocumentStore:
                 if len(order) >= top_docs:
                     break
 
-        key_by_id = {r['doc_id']: k for k, r in self.docs.items()}
         results = []
         for rank, doc_id in enumerate(order):
-            key = key_by_id.get(doc_id)
+            key = self._key_by_id.get(doc_id)
             if key is None:
                 continue                      # document supprimé
             rec = self.docs[key]
