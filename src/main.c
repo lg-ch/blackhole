@@ -342,7 +342,7 @@ static int count_vecs(const char* path, int dim_expected) {
     struct stat st;
     if (stat(path, &st) != 0) { perror("stat"); return -1; }
 
-    if (fmt == VECFMT_U8BIN || fmt == VECFMT_FBIN) {
+    if (fmt == VECFMT_U8BIN || fmt == VECFMT_FBIN || fmt == VECFMT_F16BIN) {
         FILE* f = fopen(path, "rb");
         if (!f) { perror("fopen header"); return -1; }
         uint32_t hdr[2];
@@ -352,7 +352,8 @@ static int count_vecs(const char* path, int dim_expected) {
             fprintf(stderr, "dim %u != expected %d\n", hdr[1], dim_expected);
             return -1;
         }
-        long elem = (fmt == VECFMT_U8BIN) ? 1L : 4L;
+        long elem = (fmt == VECFMT_U8BIN) ? 1L
+                  : (fmt == VECFMT_F16BIN) ? 2L : 4L;
         long expected = 8L + (long)hdr[0] * dim_expected * elem;
         if (st.st_size > expected) {
             fprintf(stderr, "size %ld > expected %ld — trailing garbage?\n",

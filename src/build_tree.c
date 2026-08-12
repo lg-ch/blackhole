@@ -126,13 +126,15 @@ int calibrate_and_save_medians(const char* vecs_path, const char* index_dir,
     int fd = open(vecs_path, O_RDONLY);
     if (fd < 0) { perror("calibrate: open vecs"); return -1; }
     float* sample = (float*)malloc((size_t)sample_n * dim * sizeof(float));
-    uint8_t* u8row = (uint8_t*)malloc((size_t)dim);
+    /* scratch de conversion : dim octets (u8) ou dim×2 (f16) */
+    uint8_t* u8row = (uint8_t*)malloc((size_t)dim * 2);
     if (!sample || !u8row) { free(sample); free(u8row); close(fd); return -1; }
     /* Strided sample : row i × stride, avoids file-order bias. Stride
        derived from the file size so the sample spans the whole corpus. */
     struct stat stt; fstat(fd, &stt);
-    long n_total = (long)((stt.st_size - ((fmt==VECFMT_U8BIN||fmt==VECFMT_FBIN)?8:0))
-                          / (vec_row_bytes(fmt, dim) + ((fmt==VECFMT_BVECS||fmt==VECFMT_FVECS)?4:0)));
+    long n_total = (long)((stt.st_size -
+        ((fmt==VECFMT_U8BIN||fmt==VECFMT_FBIN||fmt==VECFMT_F16BIN)?8:0))
+        / (vec_row_bytes(fmt, dim) + ((fmt==VECFMT_BVECS||fmt==VECFMT_FVECS)?4:0)));
     long stride_rows = n_total > sample_n ? n_total / sample_n : 1;
     int got = 0;
     for (int i = 0; i < sample_n; i++) {
@@ -141,6 +143,10 @@ int calibrate_and_save_medians(const char* vecs_path, const char* index_dir,
         if (fmt == VECFMT_U8BIN || fmt == VECFMT_BVECS) {
             if (pread(fd, u8row, rb, off) != (ssize_t)rb) break;
             vec_u8_to_f32(u8row, sample + (size_t)got * dim, dim);
+        } else if (fmt == VECFMT_F16BIN) {
+            if (pread(fd, u8row, rb, off) != (ssize_t)rb) break;
+            vec_f16_to_f32((const uint16_t*)u8row,
+                           sample + (size_t)got * dim, dim);
         } else {
             if (pread(fd, sample + (size_t)got * dim, rb, off) != (ssize_t)rb) break;
         }
@@ -258,8 +264,8 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
     FILE* fin = fopen(vecs_path, "rb");
     if (!fin) { perror("fopen vecs"); return -1; }
 
-    /* Skip the per-file header for u8bin / fbin (both: 8 B = n, dim). */
-    if (fmt == VECFMT_U8BIN || fmt == VECFMT_FBIN) {
+    /* Skip the per-file header for u8bin / fbin / f16bin (8 B = n, dim). */
+    if (fmt == VECFMT_U8BIN || fmt == VECFMT_FBIN || fmt == VECFMT_F16BIN) {
         uint32_t hdr[2];
         if (fread(hdr, 4, 2, fin) != 2) {
             fprintf(stderr, "header read failed\n");
@@ -275,10 +281,11 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
     int seek_rows = doc_offset + n_done;
     if (seek_rows > 0) {
         off_t row;
-        if      (fmt == VECFMT_U8BIN) row = (off_t)dim;
-        else if (fmt == VECFMT_BVECS) row = (off_t)4 + (off_t)dim;
-        else if (fmt == VECFMT_FBIN)  row = (off_t)dim * 4;
-        else                          row = (off_t)4 + (off_t)dim * 4;
+        if      (fmt == VECFMT_U8BIN)  row = (off_t)dim;
+        else if (fmt == VECFMT_BVECS)  row = (off_t)4 + (off_t)dim;
+        else if (fmt == VECFMT_FBIN)   row = (off_t)dim * 4;
+        else if (fmt == VECFMT_F16BIN) row = (off_t)dim * 2;
+        else                           row = (off_t)4 + (off_t)dim * 4;
         if (fseeko(fin, row * (off_t)seek_rows, SEEK_CUR) != 0) {
             perror("seek doc_offset/resume"); fclose(fin); return -1;
         }
@@ -301,8 +308,10 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
     }
 
     float*   vec    = (float*)  malloc((size_t)dim * sizeof(float));
-    int      need_u8 = (fmt == VECFMT_U8BIN || fmt == VECFMT_BVECS);
-    uint8_t* u8_buf = need_u8 ? (uint8_t*)malloc((size_t)dim) : NULL;
+    /* scratch de conversion partagé : u8 (dim o) ou f16 (dim×2 o) */
+    int      need_u8 = (fmt == VECFMT_U8BIN || fmt == VECFMT_BVECS
+                        || fmt == VECFMT_F16BIN);
+    uint8_t* u8_buf = need_u8 ? (uint8_t*)malloc((size_t)dim * 2) : NULL;
     if (!vec || (need_u8 && !u8_buf)) {
         free(vec); free(u8_buf); fclose(fin); return -1;
     }
@@ -316,9 +325,10 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
 #else
     int n_threads = 1;
 #endif
-    const char* fmt_name = (fmt == VECFMT_U8BIN) ? "u8bin"
-                         : (fmt == VECFMT_BVECS) ? "bvecs"
-                         : (fmt == VECFMT_FBIN)  ? "fbin" : "fvecs";
+    const char* fmt_name = (fmt == VECFMT_U8BIN)  ? "u8bin"
+                         : (fmt == VECFMT_BVECS)  ? "bvecs"
+                         : (fmt == VECFMT_FBIN)   ? "fbin"
+                         : (fmt == VECFMT_F16BIN) ? "f16bin" : "fvecs";
     fprintf(stderr, "  using %d threads, sub_dim=%d, gen_v%d, fmt=%s\n",
             n_threads, use_sub ? sub_dim : dim,
             get_gen_version(),
@@ -333,7 +343,8 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
     int BATCH = g_fast_mode ? 4096 : 256;
     if (g_cli_build_batch > 0) BATCH = g_cli_build_batch;
     float*   vec_buf  = (float*)malloc((size_t)BATCH * dim * sizeof(float));
-    uint8_t* u8_batch = need_u8 ? (uint8_t*)malloc((size_t)BATCH * dim) : NULL;
+    uint8_t* u8_batch = need_u8 ? (uint8_t*)malloc((size_t)BATCH * dim * 2)
+                                : NULL;
     int*     batch_doc_ids = (int*)malloc((size_t)BATCH * sizeof(int));
     char*    batch_ok = (char*)malloc((size_t)BATCH);
     if (!vec_buf || (need_u8 && !u8_batch) || !batch_doc_ids || !batch_ok) {
@@ -412,7 +423,7 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
         int b;
         for (b = 0; b < batch_n; b++) {
             float* vb = vec_buf + (size_t)b * dim;
-            uint8_t* ub = u8_batch ? (u8_batch + (size_t)b * dim) : NULL;
+            uint8_t* ub = u8_batch ? (u8_batch + (size_t)b * dim * 2) : NULL;
             int ok = 1;
             /* TAIL mode : if fread returns short, retry with wait (WAL not
                yet at position). Otherwise break batch as before. */
@@ -427,6 +438,9 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
                     else vec_u8_to_f32(ub, vb, dim);
                 } else if (fmt == VECFMT_FBIN) {
                     if (fread(vb, 4, dim, fin) != (size_t)dim) ok = 0;
+                } else if (fmt == VECFMT_F16BIN) {
+                    if (fread(ub, 2, dim, fin) != (size_t)dim) ok = 0;
+                    else vec_f16_to_f32((const uint16_t*)ub, vb, dim);
                 } else {
                     if (fread(&dread, 4, 1, fin) != 1 || dread != dim ||
                         fread(vb, 4, dim, fin) != (size_t)dim) ok = 0;
@@ -897,6 +911,15 @@ static int read_doc_vec(int bfd, VecFmt fmt, int doc_id, int dim,
         if (pread(bfd, u8scratch, (size_t)dim, off) != (ssize_t)dim)
             return -1;
         vec_u8_to_f32(u8scratch, out, dim);
+        return 0;
+    }
+    if (fmt == VECFMT_F16BIN) {
+        /* scratch local : les appelants n'allouent que dim octets */
+        uint16_t h16[1024];
+        if (dim > 1024) return -1;
+        if (pread(bfd, h16, (size_t)dim * 2, off) != (ssize_t)(dim * 2))
+            return -1;
+        vec_f16_to_f32(h16, out, dim);
         return 0;
     }
     if (pread(bfd, out, (size_t)dim * 4, off) != (ssize_t)(dim * 4))
