@@ -38,6 +38,14 @@ int read_vec_at(int fd, VecFmt fmt, int idx, int dim, float* out) {
         vec_u8_to_f32(buf, out, dim);
         return 0;
     }
+    if (fmt == VECFMT_F16BIN) {
+        uint16_t buf16[1024];
+        if (dim > 1024) return -1;
+        ssize_t n = pread(fd, buf16, (size_t)dim * 2, off);
+        if (n != (ssize_t)(dim * 2)) return -1;
+        vec_f16_to_f32(buf16, out, dim);
+        return 0;
+    }
     ssize_t n = pread(fd, out, (size_t)dim * 4, off);
     return (n == (ssize_t)(dim * 4)) ? 0 : -1;
 }
@@ -136,7 +144,8 @@ int rerank_l2_uring(struct io_uring* ring,
        → ignorées naturellement par la réduction. */
     float* dists = (float*)malloc((size_t)n_cands * sizeof(float));
     if (!dists) { free(valid); free(raw); return -1; }
-    int is_u8 = (base_fmt == VECFMT_U8BIN || base_fmt == VECFMT_BVECS);
+    int is_u8  = (base_fmt == VECFMT_U8BIN || base_fmt == VECFMT_BVECS);
+    int is_f16 = (base_fmt == VECFMT_F16BIN);
     #pragma omp parallel
     {
         float tmpf[1024];
@@ -146,6 +155,10 @@ int rerank_l2_uring(struct io_uring* ring,
             const float* fv;
             if (is_u8) {
                 vec_u8_to_f32(raw + (size_t)i * row_bytes, tmpf, dim);
+                fv = tmpf;
+            } else if (is_f16) {
+                vec_f16_to_f32((const uint16_t*)(raw + (size_t)i * row_bytes),
+                               tmpf, dim);
                 fv = tmpf;
             } else {
                 fv = (const float*)(raw + (size_t)i * row_bytes);
