@@ -462,11 +462,14 @@ static int pathrank_cmp_desc(const void* a, const void* b) {
     return 0;
 }
 
-int mg_query_pathrank(void* h, const float* qvec,
-                      int n_probes, int top_paths, int top_n,
-                      int query_depth,
-                      const uint8_t* allowed_state, int allowed_state_len,
-                      int* out_ids, int* out_votes) {
+/* Cœur du pathrank : prend le bitmap de filtre DIRECTEMENT (in-process).
+   Les wrappers publics en dessous gèrent la désérialisation ch_state
+   (chemin ClickHouse historique) ou passent un bitmap natif (mg_meta). */
+static int query_pathrank_core(void* h, const float* qvec,
+                               int n_probes, int top_paths, int top_n,
+                               int query_depth,
+                               const roaring_bitmap_t* allowed,
+                               int* out_ids, int* out_votes) {
     if (!h) return -1;
     Forest* f = (Forest*)h;
     int nt = f->n_trees, dim = f->dim, sub = f->sub_dim, depth = f->depth;
@@ -540,20 +543,41 @@ int mg_query_pathrank(void* h, const float* qvec,
     }
     free(rank);
 
+    int n = forest_collect_topn_probes(f, leaves, n_sets, top_n, qd_eff,
+                                       allowed,
+                                       (int32_t*)out_ids, (int32_t*)out_votes);
+    free(leaves);
+    return n;
+}
+
+int mg_query_pathrank(void* h, const float* qvec,
+                      int n_probes, int top_paths, int top_n,
+                      int query_depth,
+                      const uint8_t* allowed_state, int allowed_state_len,
+                      int* out_ids, int* out_votes) {
     roaring_bitmap_t* allowed = NULL;
     if (allowed_state && allowed_state_len > 0) {
         int card = 0;
         allowed = roaring_from_ch_state(allowed_state, (size_t)allowed_state_len, &card);
         (void)card;
-        if (!allowed) { free(leaves); return -1; }
+        if (!allowed) return -1;
     }
-
-    int n = forest_collect_topn_probes(f, leaves, n_sets, top_n, qd_eff,
-                                       allowed,
-                                       (int32_t*)out_ids, (int32_t*)out_votes);
+    int n = query_pathrank_core(h, qvec, n_probes, top_paths, top_n,
+                                query_depth, allowed, out_ids, out_votes);
     if (allowed) roaring_bitmap_free(allowed);
-    free(leaves);
     return n;
+}
+
+/* Variante native : le filtre est un roaring_bitmap_t* du MÊME process
+   (sorti de mg_meta_filter) — zéro sérialisation, zéro réseau, zéro copie. */
+int mg_query_pathrank_bm(void* h, const float* qvec,
+                         int n_probes, int top_paths, int top_n,
+                         int query_depth, void* allowed_bm,
+                         int* out_ids, int* out_votes) {
+    return query_pathrank_core(h, qvec, n_probes, top_paths, top_n,
+                               query_depth,
+                               (const roaring_bitmap_t*)allowed_bm,
+                               out_ids, out_votes);
 }
 
 /* ---------- Pathrank by LEAF SIZE variant (experimental) ----------
@@ -1505,6 +1529,26 @@ int mg_tombstones_flush(void* h) {
 int mg_tombstones_count(void* h) {
     return h ? forest_tombstone_count((Forest*)h) : -1;
 }
+
+/* ---------- Métadonnées natives (meta_store) ---------- */
+
+#include "meta_store.h"
+
+void* mg_meta_open(const char* dir)          { return meta_open(dir); }
+void  mg_meta_close(void* m)                 { meta_close((MetaStore*)m); }
+int   mg_meta_add_batch(void* m, const char* key,
+                        const uint32_t* doc_ids, int n) {
+    return meta_add_batch((MetaStore*)m, key, doc_ids, n);
+}
+int   mg_meta_compact(void* m)               { return meta_compact((MetaStore*)m); }
+void* mg_meta_filter(void* m, const char** keys,
+                     const int* group_lens, int n_groups) {
+    return meta_filter((MetaStore*)m, keys, group_lens, n_groups);
+}
+void    mg_meta_filter_free(void* bmp)       { meta_filter_free(bmp); }
+int64_t mg_meta_filter_card(void* bmp)       { return meta_bitmap_card(bmp); }
+int     mg_meta_n_keys(void* m)              { return meta_n_keys((MetaStore*)m); }
+int64_t mg_meta_delta_docs(void* m)          { return meta_delta_docs((MetaStore*)m); }
 
 /* Calibrate + write <index_dir>/medians.bin (top-level median thresholds).
    Run BEFORE the build ; build routing and forest_open pick it up.        */

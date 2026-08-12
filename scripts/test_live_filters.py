@@ -40,12 +40,22 @@ LIVE_BASE = 30_000          # ids live : 30000..30099 (< 65536)
 
 
 def roaring_ch_state(ids):
-    """Bitmap roaring portable (1 container array) enveloppé au format
-    état ClickHouse groupBitmap : [0x01][varint taille][portable]."""
+    """Bitmap roaring portable (1 container) enveloppé au format état
+    ClickHouse groupBitmap : [0x01][varint taille][portable].
+    Spec roaring : container ARRAY (u16 triés) jusqu'à 4096 éléments,
+    container BITSET (8 Ko de bits) au-delà — un array sur-rempli est
+    parsé comme du bitset → bitmap poubelle silencieuse."""
     ids = sorted(set(int(x) for x in ids))
     assert ids and ids[-1] < 65536, 'test limité à 1 container'
     body = struct.pack('<IIHHI', 12346, 1, 0, len(ids) - 1, 16)
-    body += struct.pack('<%dH' % len(ids), *ids)
+    if len(ids) > 4096:
+        bits = np.zeros(1024, dtype=np.uint64)
+        arr = np.asarray(ids, dtype=np.uint64)
+        np.bitwise_or.at(bits, (arr >> 6).astype(np.int64),
+                         np.uint64(1) << (arr & np.uint64(63)))
+        body += bits.tobytes()
+    else:
+        body += struct.pack('<%dH' % len(ids), *ids)
     n = len(body)
     varint = bytearray()
     while True:

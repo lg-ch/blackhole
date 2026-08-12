@@ -371,6 +371,96 @@ def live_medians_depth() -> int:
     return _lib.mg_live_medians_depth()
 
 
+# ---- Métadonnées natives (meta_store : frozen views mmap + deltas WAL) ----
+_lib.mg_meta_open.argtypes  = [c_char_p]
+_lib.mg_meta_open.restype   = c_void_p
+_lib.mg_meta_close.argtypes = [c_void_p]
+_lib.mg_meta_close.restype  = None
+_lib.mg_meta_add_batch.argtypes = [c_void_p, c_char_p, POINTER(c_uint32), c_int]
+_lib.mg_meta_add_batch.restype  = c_int
+_lib.mg_meta_compact.argtypes = [c_void_p]
+_lib.mg_meta_compact.restype  = c_int
+_lib.mg_meta_filter.argtypes = [c_void_p, POINTER(c_char_p), POINTER(c_int), c_int]
+_lib.mg_meta_filter.restype  = c_void_p
+_lib.mg_meta_filter_free.argtypes = [c_void_p]
+_lib.mg_meta_filter_free.restype  = None
+_lib.mg_meta_filter_card.argtypes = [c_void_p]
+_lib.mg_meta_filter_card.restype  = ctypes.c_int64
+_lib.mg_meta_n_keys.argtypes = [c_void_p]
+_lib.mg_meta_n_keys.restype  = c_int
+_lib.mg_meta_delta_docs.argtypes = [c_void_p]
+_lib.mg_meta_delta_docs.restype  = ctypes.c_int64
+# int mg_query_pathrank_bm(h, qvec, np, tp, top_n, qd, bitmap, out_ids, out_votes)
+_lib.mg_query_pathrank_bm.argtypes = [c_void_p, POINTER(c_float), c_int, c_int,
+                                      c_int, c_int, c_void_p,
+                                      POINTER(c_int32), POINTER(c_int32)]
+_lib.mg_query_pathrank_bm.restype = c_int
+
+
+class MetaStore:
+    """Métadonnées natives : un bitmap roaring par (champ=valeur), gelés
+    mmap zéro-copie + deltas WAL. Le filtre s'évalue in-process et se passe
+    DIRECTEMENT à la query (query_pathrank_meta) : zéro sérialisation,
+    zéro réseau — contrairement au chemin ClickHouse ch_state."""
+
+    def __init__(self, directory: str):
+        self._h = _lib.mg_meta_open(directory.encode())
+        if not self._h:
+            raise RuntimeError(f'mg_meta_open failed: {directory}')
+
+    def add(self, field: str, value: str, doc_ids) -> None:
+        arr = np.ascontiguousarray(np.asarray(doc_ids, dtype=np.uint32))
+        key = f'{field}={value}'.encode()
+        rc = _lib.mg_meta_add_batch(
+            self._h, key, arr.ctypes.data_as(POINTER(c_uint32)), len(arr))
+        if rc != 0:
+            raise RuntimeError(f'meta add({key}) failed')
+
+    def compact(self) -> int:
+        rc = _lib.mg_meta_compact(self._h)
+        if rc < 0:
+            raise RuntimeError('meta compact failed')
+        return rc
+
+    def filter(self, where: dict):
+        """where = {champ: valeur | [valeurs]} — groupes ANDés entre champs,
+        valeurs ORées dans un champ. Retourne un handle bitmap (à libérer
+        via filter_free après la/les queries)."""
+        keys, lens = [], []
+        for field, values in where.items():
+            vals = values if isinstance(values, (list, tuple)) else [values]
+            for v in vals:
+                keys.append(f'{field}={v}'.encode())
+            lens.append(len(vals))
+        karr = (c_char_p * len(keys))(*keys)
+        larr = (c_int * len(lens))(*lens)
+        bmp = _lib.mg_meta_filter(self._h, karr, larr, len(lens))
+        if not bmp:
+            raise RuntimeError('meta filter failed')
+        return bmp
+
+    @staticmethod
+    def filter_free(bmp) -> None:
+        _lib.mg_meta_filter_free(bmp)
+
+    @staticmethod
+    def filter_card(bmp) -> int:
+        return _lib.mg_meta_filter_card(bmp)
+
+    @property
+    def n_keys(self) -> int:
+        return _lib.mg_meta_n_keys(self._h)
+
+    @property
+    def delta_docs(self) -> int:
+        return _lib.mg_meta_delta_docs(self._h)
+
+    def close(self) -> None:
+        if self._h:
+            _lib.mg_meta_close(self._h)
+            self._h = None
+
+
 # int mg_traverse_batch(vecs, n_vecs, dim, sub_dim, depth, n_trees, out)
 _lib.mg_traverse_batch.argtypes = [POINTER(c_float), c_int, c_int, c_int,
                                    c_int, c_int, POINTER(c_int32)]
@@ -703,6 +793,27 @@ class Forest:
         return best_ids, best_votes, best_n, {
             'attempts': attempts, 'mlb_used': best_mlb, 'partial': best_partial,
         }
+
+    def query_pathrank_meta(self, qvec, n_probes: int, top_paths: int,
+                            meta_bitmap, top_n: int = 4000,
+                            query_depth: int = 0):
+        """query_pathrank filtré par un bitmap métadonnées NATIF (handle
+        retourné par MetaStore.filter) — même process, zéro sérialisation.
+        meta_bitmap=None → pas de filtre."""
+        if qvec.dtype != np.float32:
+            qvec = qvec.astype(np.float32, copy=False)
+        if not qvec.flags['C_CONTIGUOUS']:
+            qvec = np.ascontiguousarray(qvec)
+        ids   = np.empty(top_n, dtype=np.int32)
+        votes = np.empty(top_n, dtype=np.int32)
+        n = _lib.mg_query_pathrank_bm(
+            self._h, qvec.ctypes.data_as(POINTER(c_float)),
+            n_probes, top_paths, top_n, query_depth, meta_bitmap,
+            ids.ctypes.data_as(POINTER(c_int32)),
+            votes.ctypes.data_as(POINTER(c_int32)))
+        if n < 0:
+            raise RuntimeError('mg_query_pathrank_bm failed')
+        return ids, votes, n
 
     def query(self, qvec: np.ndarray, top_n: int = 500, query_depth: int = 0,
               allowed_state: bytes | None = None
