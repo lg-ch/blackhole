@@ -262,9 +262,11 @@ def run():
     stop = threading.Event()
     n_ins = [0]
 
+    run_tag = os.getpid()          # le registre est persistant : clés
+                                   # uniques par run pour la rejouabilité
     def injector():
         while not stop.is_set():
-            key = f'live-{n_ins[0]}'
+            key = f'live-{run_tag}-{n_ins[0]}'
             ds.insert_document(key, chunks=[f'chunk {key} {i}'
                                             for i in range(PER_DOC)],
                                metadata={'lang': 'fr', 'year': 2024})
