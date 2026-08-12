@@ -1548,6 +1548,9 @@ void* mg_meta_filter(void* m, const char** keys,
 void    mg_meta_filter_free(void* bmp)       { meta_filter_free(bmp); }
 int64_t mg_meta_filter_card(void* bmp)       { return meta_bitmap_card(bmp); }
 int     mg_meta_n_keys(void* m)              { return meta_n_keys((MetaStore*)m); }
+int     mg_meta_list_keys(void* m, char* out, int cap) {
+    return meta_list_keys((MetaStore*)m, out, cap);
+}
 int64_t mg_meta_delta_docs(void* m)          { return meta_delta_docs((MetaStore*)m); }
 
 /* Calibrate + write <index_dir>/medians.bin (top-level median thresholds).

@@ -310,6 +310,23 @@ int64_t meta_bitmap_card(void* bmp) {
 
 int meta_n_keys(MetaStore* m) { return m ? m->n_keys : -1; }
 
+int meta_list_keys(MetaStore* m, char* out, int cap) {
+    if (!m || !out || cap <= 0) return -1;
+    pthread_mutex_lock(&m->mu);
+    int pos = 0;
+    for (int i = 0; i < m->n_keys; i++) {
+        int kl = (int)strlen(m->keys[i].key);
+        if (pos + kl + 2 > cap) break;
+        memcpy(out + pos, m->keys[i].key, (size_t)kl);
+        pos += kl;
+        out[pos++] = '\n';
+    }
+    out[pos > 0 ? pos - 1 : 0] = 0;
+    int n = m->n_keys;
+    pthread_mutex_unlock(&m->mu);
+    return n;
+}
+
 int64_t meta_delta_docs(MetaStore* m) {
     if (!m) return -1;
     int64_t n = 0;

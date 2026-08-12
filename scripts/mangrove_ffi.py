@@ -390,6 +390,8 @@ _lib.mg_meta_n_keys.argtypes = [c_void_p]
 _lib.mg_meta_n_keys.restype  = c_int
 _lib.mg_meta_delta_docs.argtypes = [c_void_p]
 _lib.mg_meta_delta_docs.restype  = ctypes.c_int64
+_lib.mg_meta_list_keys.argtypes = [c_void_p, ctypes.c_char_p, c_int]
+_lib.mg_meta_list_keys.restype  = c_int
 # int mg_query_pathrank_bm(h, qvec, np, tp, top_n, qd, bitmap, out_ids, out_votes)
 _lib.mg_query_pathrank_bm.argtypes = [c_void_p, POINTER(c_float), c_int, c_int,
                                       c_int, c_int, c_void_p,
@@ -416,6 +418,17 @@ class MetaStore:
         if rc != 0:
             raise RuntimeError(f'meta add({key}) failed')
 
+    def add_keys(self, keys: list[str], doc_ids) -> None:
+        """Ajoute les mêmes doc_ids sous plusieurs clés DÉJÀ ENCODÉES
+        (sortie de metatypes.encode_meta — inclut les clés de présence)."""
+        arr = np.ascontiguousarray(np.asarray(doc_ids, dtype=np.uint32))
+        for k in keys:
+            rc = _lib.mg_meta_add_batch(
+                self._h, k.encode(),
+                arr.ctypes.data_as(POINTER(c_uint32)), len(arr))
+            if rc != 0:
+                raise RuntimeError(f'meta add_keys({k}) failed')
+
     def compact(self) -> int:
         rc = _lib.mg_meta_compact(self._h)
         if rc < 0:
@@ -439,6 +452,15 @@ class MetaStore:
             raise RuntimeError('meta filter failed')
         return bmp
 
+    def filter_keys(self, flat_keys: list[str], group_lens: list[int]):
+        """Variante bas-niveau : clés déjà compilées (metatypes.compile_where)."""
+        karr = (c_char_p * len(flat_keys))(*[k.encode() for k in flat_keys])
+        larr = (c_int * len(group_lens))(*group_lens)
+        bmp = _lib.mg_meta_filter(self._h, karr, larr, len(group_lens))
+        if not bmp:
+            raise RuntimeError('meta filter_keys failed')
+        return bmp
+
     @staticmethod
     def filter_free(bmp) -> None:
         _lib.mg_meta_filter_free(bmp)
@@ -450,6 +472,17 @@ class MetaStore:
     @property
     def n_keys(self) -> int:
         return _lib.mg_meta_n_keys(self._h)
+
+    def keys(self) -> list[str]:
+        """Dictionnaire des clés connues (gelées + deltas). Sert à
+        l'expansion regex/plages côté SDK."""
+        cap = 1 << 20
+        buf = ctypes.create_string_buffer(cap)
+        n = _lib.mg_meta_list_keys(self._h, buf, cap)
+        if n < 0:
+            raise RuntimeError('meta list_keys failed')
+        raw = buf.value.decode()
+        return raw.split('\n') if raw else []
 
     @property
     def delta_docs(self) -> int:

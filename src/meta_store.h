@@ -50,4 +50,9 @@ int64_t meta_bitmap_card(void* bmp);
 int      meta_n_keys(MetaStore* m);
 int64_t  meta_delta_docs(MetaStore* m);
 
+/* Dictionnaire des clés, jointes par '\n' dans out (tronqué à cap-1,
+   toujours NUL-terminé). Retourne le nombre total de clés. Sert au SDK
+   pour l'expansion regex/plages sur le dictionnaire. */
+int meta_list_keys(MetaStore* m, char* out, int cap);
+
 #endif
