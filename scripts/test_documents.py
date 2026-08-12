@@ -100,7 +100,7 @@ def main():
         # [1] retrouvabilité + fenêtre
         idx = ds._idx_view()
         probe_doc, probe_seq = 'doc-017', 3
-        rec = ds.docs[probe_doc]
+        rec = ds.get_document(probe_doc)
         e = idx[rec['first_chunk'] + probe_seq]
         probe_text = ds._read_chunk_text(int(e['off']), int(e['len']))
         r = ds.search(text=probe_text, top_docs=3, window=1)
@@ -140,8 +140,25 @@ def main():
         # [6] delete
         ds.delete_document(probe_doc)
         r = ds.search(text=probe_text, top_docs=3)
-        gone = all(x['key'] != probe_doc for x in r)
+        gone = all(x['key'] != probe_doc for x in r) \
+            and ds.get_document(probe_doc) is None
         print(f'[6] delete doc-017 : absent des résultats={gone}')
+
+        # [7] persistance : close + reopen (registre disque + hash disque)
+        ds.close()
+        ds = DocumentStore(os.path.join(tmp, 'docstore'), f, hot,
+                           fake_embed_factory(T.DIM),
+                           dim=T.DIM, depth=T.DEPTH, sub_dim=T.SUB_DIM,
+                           n_trees=T.N_TREES,
+                           float_specs={'score': FloatSpec(decimals=2)})
+        rec2 = ds.get_document('doc-030')
+        e2 = idx[rec2['first_chunk'] + 2]
+        t2 = ds._read_chunk_text(int(e2['off']), int(e2['len']))
+        r = ds.search(text=t2, top_docs=3)
+        persist_ok = (rec2 is not None and rec2['meta'] == infos['doc-030']
+                      and r and r[0]['key'] == 'doc-030'
+                      and ds.get_document(probe_doc) is None)
+        print(f'[7] reopen : doc-030 retrouvé={persist_ok}')
 
         mf._lib.mg_forest_set_hot_overlay(None)
         mf._lib.mg_hot_free(hot)
@@ -149,7 +166,7 @@ def main():
         f.close()
 
         ok = (win_ok and only_fr and bool(yr_ok) and bool(re_ok)
-              and bool(fl_ok) and gone)
+              and bool(fl_ok) and gone and persist_ok)
         print('PASS' if ok else 'FAIL')
         return 0 if ok else 1
     finally:
