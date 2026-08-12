@@ -20,7 +20,10 @@ rpforest: $(OBJ)
 libmangrove.so: $(CORE_OBJ)
 	$(CC) $(CFLAGS) -shared -o $@ $(CORE_OBJ) $(LDFLAGS)
 
-%.o: %.c
+# Dépendance aux headers : sans elle, modifier un .h (fonctions inline !)
+# laisse des .o périmés — un ffi.o compilé avec l'ancien vec_fmt_from_path
+# a fait lire du f16bin avec des offsets fvecs. Grossier mais sûr.
+%.o: %.c $(wildcard src/*.h)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
