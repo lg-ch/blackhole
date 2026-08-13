@@ -1770,6 +1770,19 @@ int forest_collect_topn_probes(const Forest* f,
        per cursor. Kept as-is so the bitmap-pre-filter semantics are preserved
        exactly. The pre-merge path above is only enabled when there is no
        caller-side filter to apply during the merge. */
+
+    /* k_shift > 0 : chaque curseur couvre 2^k_shift feuilles concaténées —
+       triées chacune mais pas entre elles. Le loser-tree ET l'itérateur
+       roaring (forward-only) exigent des séquences croissantes par curseur :
+       sans ce tri, les éligibles situés après un retour en arrière sont
+       sautés et les votes d'un même doc se fragmentent (recall qui CHUTE
+       quand qd baisse — l'inverse du comportement sain).                  */
+    if (k_shift > 0) {
+        for (size_t li = 0; li < nL; li++) {
+            if (lens[li] > 1)
+                qsort(docs + bpos[li], lens[li], sizeof(uint32_t), cmp_uint32);
+        }
+    }
     roaring_uint32_iterator_t* iters = (roaring_uint32_iterator_t*)malloc(nL * sizeof(*iters));
     for (size_t li = 0; li < nL; li++) roaring_init_iterator(allowed, &iters[li]);
 
