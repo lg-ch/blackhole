@@ -35,10 +35,10 @@ STORE = f'{ROOT}/selstore'
 
 NT, DIM, SD, DEPTH, NDOCS = 256, 96, 16, 22, 50_000_000
 MED = 13
-QD = 17
+QD = int(os.environ.get('SEL_QD', '17'))
 NQ = 100
 TOPN_ROW = 100_000
-RS = (8, 16)
+RS = tuple(int(x) for x in os.environ.get('SEL_RS', '8,16').split(','))
 
 
 def log(m):
@@ -192,9 +192,9 @@ def main():
                     f'p50 {row["p50_ms"]:7.1f} ms (dont walk py '
                     f'{row["walk_p50_ms"]:.0f}) pool {row["pool_mean"]:,}')
         out[name] = res
-        with open(f'{STORE}/qd17.json', 'w') as fp:
+        with open(f'{STORE}/qd{QD}.json', 'w') as fp:
             json.dump(out, fp, indent=1)
-    log('QD17 OK')
+    log(f'QD{QD} OK')
 
 
 if __name__ == '__main__':
