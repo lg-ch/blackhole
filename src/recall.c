@@ -112,32 +112,45 @@ int rerank_l2_uring(struct io_uring* ring,
     uint8_t* raw = (uint8_t*)malloc((size_t)n_cands * row_bytes);
     if (!raw) return -1;
 
-    for (int i = 0; i < n_cands; i++) {
-        struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
-        if (!sqe) {
-            io_uring_submit(ring);
-            sqe = io_uring_get_sqe(ring);
-            if (!sqe) { free(raw); return -1; }
-        }
-        off_t off = vec_row_offset(base_fmt, cand_ids[i], dim);
-        io_uring_prep_read(sqe, base_fd, raw + (size_t)i * row_bytes,
-                           (unsigned)row_bytes, (uint64_t)off);
-        io_uring_sqe_set_data(sqe, (void*)(uintptr_t)i);
-    }
-    int submitted = io_uring_submit(ring);
-    if (submitted < 0) { free(raw); return -1; }
-
-    /* Phase 1 : drain toutes les CQE. On perd le CPU/IO overlap mais on
-       débloque le pass CPU en parallèle sur tous les cands d'un coup. */
+    /* Phase 1 : soumission FENÊTRÉE avec récolte au fil de l'eau.
+       L'ancienne version soumettait n_cands lectures d'un bloc puis
+       récoltait : au-delà de la capacité de la completion-queue
+       (~2× la SQ, soit ~8192), les CQE débordaient et les candidats
+       concernés restaient valid=0 → INFINITY → exclus SILENCIEUSEMENT
+       du rerank. À 1M de candidats, ~10 % du vrai top-10 disparaissait
+       (mesuré : pool contenant 99/100 GT, rerank n'en rendant que 90).
+       La fenêtre borne les lectures en vol sous la capacité de la CQ. */
     uint8_t* valid = (uint8_t*)calloc((size_t)n_cands, 1);
     if (!valid) { free(raw); return -1; }
-    for (int reaped = 0; reaped < n_cands; reaped++) {
-        struct io_uring_cqe* cqe;
-        if (io_uring_wait_cqe(ring, &cqe) < 0) continue;
-        int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
-        int res = cqe->res;
-        io_uring_cqe_seen(ring, cqe);
-        if (res == (int)row_bytes) valid[idx] = 1;
+    const int WINDOW = 2048;
+    int next = 0, inflight = 0;
+    while (next < n_cands || inflight > 0) {
+        while (next < n_cands && inflight < WINDOW) {
+            struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
+            if (!sqe) break;
+            off_t off = vec_row_offset(base_fmt, cand_ids[next], dim);
+            io_uring_prep_read(sqe, base_fd,
+                               raw + (size_t)next * row_bytes,
+                               (unsigned)row_bytes, (uint64_t)off);
+            io_uring_sqe_set_data(sqe, (void*)(uintptr_t)next);
+            next++; inflight++;
+        }
+        if (io_uring_submit(ring) < 0) { free(valid); free(raw); return -1; }
+        if (inflight > 0) {
+            struct io_uring_cqe* cqe;
+            if (io_uring_wait_cqe(ring, &cqe) == 0) {
+                int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+                if (cqe->res == (int)row_bytes) valid[idx] = 1;
+                io_uring_cqe_seen(ring, cqe);
+                inflight--;
+            }
+            while (inflight > 0 && io_uring_peek_cqe(ring, &cqe) == 0) {
+                int idx = (int)(uintptr_t)io_uring_cqe_get_data(cqe);
+                if (cqe->res == (int)row_bytes) valid[idx] = 1;
+                io_uring_cqe_seen(ring, cqe);
+                inflight--;
+            }
+        }
     }
 
     /* Phase 2 : l2sq parallèle. Distance INFINITY pour les reads invalides
