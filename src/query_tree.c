@@ -329,7 +329,11 @@ int forest_open(Forest* f, const char* index_dir,
         snprintf(mpath, sizeof(mpath), "%s/medians.bin", index_dir);
         int mnt = 0, mmd = 0;
         float* tab = medians_load(mpath, &mnt, &mmd);
-        if (tab && mnt == f->n_trees) { f->medians = tab; f->med_depth = mmd; }
+        /* mnt >= n_trees : une forêt ouverte sur un PRÉFIXE d'arbres (sous-
+           forêt) utilise le préfixe de la table. Jeter les médianes ici
+           ferait requêter en sign-split un index rangé aux médianes →
+           stranding massif (self-vote 9/64 mesuré sur LAION-10M).        */
+        if (tab && mnt >= f->n_trees) { f->medians = tab; f->med_depth = mmd; }
         else { free(tab); f->medians = NULL; f->med_depth = 0; }
     }
     strncpy(f->index_dir, index_dir, sizeof(f->index_dir) - 1);
