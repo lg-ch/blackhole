@@ -84,6 +84,15 @@ int32_t traverse_sub_trace(const float* vec, int full_dim, int sub_dim, int dept
    path leading to that leaf (combining main-path margins before flip + sibling
    continuation margins after flip). Larger score = clearer decisions = path
    landed in a denser leaf (empirically correlated with GT hit rate).         */
+/* Multi-flip (séquence de perturbation) : dépasse le plafond single-flip
+   de depth probes/arbre en énumérant les ensembles de flips par coût
+   croissant. Mêmes conventions de sortie que la variante scored.        */
+int traverse_sub_probes_multi_scored(const float* vec, int full_dim,
+                                     int sub_dim, int depth, uint64_t ts,
+                                     float* v0, float* v1, int* dims,
+                                     int n_probes, int min_flip_level,
+                                     int32_t* out_nodes, float* out_scores);
+
 int traverse_sub_probes_scored(const float* vec, int full_dim, int sub_dim, int depth,
                                uint64_t ts, float* v0, float* v1, int* dims,
                                int n_probes, int min_flip_level,

@@ -426,6 +426,143 @@ int traverse_sub_probes_scored(const float* vec, int full_dim, int sub_dim, int 
     return count;
 }
 
+/* ---- Générateur MULTI-FLIP (séquence de perturbation, style multi-probe
+   LSH) ----------------------------------------------------------------
+   Le single-flip plafonne à `depth − min_flip_level` probes distinctes par
+   arbre (~16-32) : mesuré sur LAION-10M, au-delà les pools sont
+   bit-identiques. Ici on énumère les ENSEMBLES de niveaux flippés S par
+   coût croissant (somme des marges des niveaux flippés) via le tas
+   extend/shift classique : {i} → {i, i+1} (extension) et {..i} → {..i+1}
+   (décalage), sur les niveaux triés par marge croissante. Chaque probe
+   re-descend réellement l'arbre (hyperplans par nœud, médianes armées),
+   flips appliqués aux niveaux de S : géométrie exacte, masques distincts
+   ⇒ feuilles distinctes. Score = min-marge du chemin réellement parcouru
+   (compatible avec le classement global de pathrank).                    */
+typedef struct { float cost; uint64_t mask; int last; } PSetEnt;
+
+static inline void pset_push(PSetEnt* h, int* n, PSetEnt e) {
+    int i = (*n)++;
+    h[i] = e;
+    while (i > 0) {
+        int p = (i - 1) >> 1;
+        if (h[p].cost <= h[i].cost) break;
+        PSetEnt t = h[p]; h[p] = h[i]; h[i] = t;
+        i = p;
+    }
+}
+
+static inline PSetEnt pset_pop(PSetEnt* h, int* n) {
+    PSetEnt top = h[0];
+    h[0] = h[--(*n)];
+    int i = 0;
+    for (;;) {
+        int l = 2 * i + 1, r = l + 1, m = i;
+        if (l < *n && h[l].cost < h[m].cost) m = l;
+        if (r < *n && h[r].cost < h[m].cost) m = r;
+        if (m == i) break;
+        PSetEnt t = h[m]; h[m] = h[i]; h[i] = t;
+        i = m;
+    }
+    return top;
+}
+
+int traverse_sub_probes_multi_scored(const float* vec, int full_dim,
+                                     int sub_dim, int depth, uint64_t ts,
+                                     float* v0, float* v1, int* dims,
+                                     int n_probes, int min_flip_level,
+                                     int32_t* out_nodes, float* out_scores) {
+    float margin[64];
+    if (depth > 64) depth = 64;
+    if (min_flip_level < 0) min_flip_level = 0;
+    if (min_flip_level >= depth) min_flip_level = depth > 0 ? depth - 1 : 0;
+
+    int active = (g_tree_sub > 0 && g_tree_sub < full_dim);
+    int   td  [active ? g_tree_sub : 1];
+    float vsub[active ? g_tree_sub : 1];
+    if (active) {
+        pick_tree_dims(tree_sub_seed(ts), full_dim, g_tree_sub, td);
+        for (int i = 0; i < g_tree_sub; i++) vsub[i] = vec[td[i]];
+        vec = vsub; full_dim = g_tree_sub;
+    }
+
+    /* Chemin principal : marges par niveau. */
+    int32_t node = 0;
+    float min_main = INFINITY;
+    for (int level = 0; level < depth; level++) {
+        pick_dims(ts, node, full_dim, sub_dim, dims);
+        gen_vec(node_seed(ts, node * 2),     v0, sub_dim);
+        gen_vec(node_seed(ts, node * 2 + 1), v1, sub_dim);
+        float c0 = dot_sub(vec, v0, dims, sub_dim);
+        float c1 = dot_sub(vec, v1, dims, sub_dim);
+        float mdiff = c1 - c0 - med_th(node);
+        margin[level] = fabsf(mdiff);
+        if (margin[level] < min_main) min_main = margin[level];
+        node = (mdiff > 0.0f) ? 2 * node + 2 : 2 * node + 1;
+    }
+    out_nodes[0]  = node;
+    out_scores[0] = min_main;
+    int count = 1;
+
+    /* Niveaux éligibles triés par marge croissante (tri par insertion :
+       ≤ 64 éléments). Cap à 63 pour tenir dans un masque uint64. */
+    int   ord[64];
+    float cst[64];
+    int ne = 0;
+    for (int level = min_flip_level; level < depth && ne < 63; level++) {
+        int j = ne++;
+        while (j > 0 && cst[j - 1] > margin[level]) {
+            ord[j] = ord[j - 1]; cst[j] = cst[j - 1]; j--;
+        }
+        ord[j] = level; cst[j] = margin[level];
+    }
+    if (ne == 0 || n_probes <= 0) return count;
+
+    int cap = 2 * n_probes + 8;
+    PSetEnt* heap = (PSetEnt*)malloc((size_t)cap * sizeof(PSetEnt));
+    if (!heap) return count;
+    int hn = 0;
+    pset_push(heap, &hn, (PSetEnt){cst[0], 1ull, 0});
+
+    while (hn > 0 && count < n_probes + 1) {
+        PSetEnt e = pset_pop(heap, &hn);
+        /* Masque par NIVEAU depuis le masque par index trié. */
+        uint64_t lvl_mask = 0;
+        for (int i = 0; i <= e.last; i++)
+            if (e.mask & (1ull << i)) lvl_mask |= 1ull << ord[i];
+        /* Re-descente exacte avec flips. */
+        int32_t pn = 0;
+        float minm = INFINITY;
+        for (int level = 0; level < depth; level++) {
+            pick_dims(ts, pn, full_dim, sub_dim, dims);
+            gen_vec(node_seed(ts, pn * 2),     v0, sub_dim);
+            gen_vec(node_seed(ts, pn * 2 + 1), v1, sub_dim);
+            float c0 = dot_sub(vec, v0, dims, sub_dim);
+            float c1 = dot_sub(vec, v1, dims, sub_dim);
+            float mdiff = c1 - c0 - med_th(pn);
+            float am = fabsf(mdiff);
+            if (am < minm) minm = am;
+            int go_right = (mdiff > 0.0f);
+            if (lvl_mask & (1ull << level)) go_right = !go_right;
+            pn = go_right ? 2 * pn + 2 : 2 * pn + 1;
+        }
+        out_nodes[count]  = pn;
+        out_scores[count] = minm;
+        count++;
+        /* Successeurs extend / shift. */
+        if (e.last + 1 < ne && hn + 2 <= cap) {
+            pset_push(heap, &hn, (PSetEnt){
+                e.cost + cst[e.last + 1],
+                e.mask | (1ull << (e.last + 1)), e.last + 1});
+            pset_push(heap, &hn, (PSetEnt){
+                e.cost - cst[e.last] + cst[e.last + 1],
+                (e.mask ^ (1ull << e.last)) | (1ull << (e.last + 1)),
+                e.last + 1});
+        }
+    }
+    free(heap);
+    return count;
+}
+
 int traverse_sub_probes(const float* vec, int full_dim, int sub_dim, int depth,
                         uint64_t ts, float* v0, float* v1, int* dims,
                         int n_probes, int min_flip_level, int32_t* out_nodes) {
