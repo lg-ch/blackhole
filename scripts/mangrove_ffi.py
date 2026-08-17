@@ -648,6 +648,13 @@ def set_node_perm(on: int) -> None:
     _lib.mg_set_node_perm(int(on))
 
 
+def set_probe_multiflip(on: bool) -> None:
+    """Générateur de probes multi-flip (séquence de perturbation) : dépasse
+    le plafond single-flip de ~depth probes distinctes par arbre. Opt-in —
+    à activer pour les gros budgets de probes (NP > ~15)."""
+    _lib.mg_set_probe_multiflip(1 if on else 0)
+
+
 def set_max_distinct(n: int) -> None:
     """Cap the K-way merge to n distinct candidates per query.
     0 = no cap (default). Hard-bounds p99 on heavy queries at the cost

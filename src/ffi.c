@@ -26,6 +26,9 @@
 #include <time.h>
 #include "slot_store.h"
 
+/* Flag multi-flip (défini plus bas, près des autres setters). */
+extern int g_probe_multiflip;
+
 /* Forward decls from slot_query.c */
 typedef struct {
     int         n_trees, dim, sub_dim, depth, n_docs;
@@ -514,10 +517,15 @@ static int query_pathrank_core(void* h, const float* qvec,
                                : NULL,
                     f->med_depth);
                 if (use_sub) {
-                    cnt = traverse_sub_probes_scored(qn, dim, sub, qd_eff, tree_seed(t),
-                                                     _v0, _v1, _dims,
-                                                     n_probes, 0,
-                                                     _nodes, _scores);
+                    cnt = g_probe_multiflip
+                        ? traverse_sub_probes_multi_scored(
+                              qn, dim, sub, qd_eff, tree_seed(t),
+                              _v0, _v1, _dims, n_probes, 0,
+                              _nodes, _scores)
+                        : traverse_sub_probes_scored(
+                              qn, dim, sub, qd_eff, tree_seed(t),
+                              _v0, _v1, _dims, n_probes, 0,
+                              _nodes, _scores);
                 } else {
                     _nodes[0]  = traverse(qn, dim, qd_eff, tree_seed(t), _v0, _v1);
                     _scores[0] = 0.0f;
@@ -1005,6 +1013,13 @@ int  mg_get_tree_sub_groups(void) { return get_tree_sub_groups(); }
    in-process can opt-in before fan-out. */
 void mg_set_node_perm(int on) { set_node_perm(on); }
 int  mg_get_node_perm(void)   { return get_node_perm(); }
+
+/* Générateur de probes multi-flip (opt-in, global simple — lu par les
+   threads OMP de pathrank ; PAS __thread exprès). 0 = single-flip
+   historique (défaut).                                                  */
+int g_probe_multiflip = 0;
+void mg_set_probe_multiflip(int on) { g_probe_multiflip = on ? 1 : 0; }
+int  mg_get_probe_multiflip(void)   { return g_probe_multiflip; }
 
 /* K-way merge tail cap (per-thread). 0 = no cap (default). */
 void mg_set_max_distinct(int n) { forest_set_max_distinct(n); }
