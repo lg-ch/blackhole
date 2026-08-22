@@ -648,6 +648,44 @@ def set_node_perm(on: int) -> None:
     _lib.mg_set_node_perm(int(on))
 
 
+_lib.mg_slots_v2_open.argtypes = [ctypes.c_char_p, c_int, c_int, c_int]
+_lib.mg_slots_v2_open.restype = c_void_p
+_lib.mg_slots_v2_close.argtypes = [c_void_p]
+_lib.mg_query_v2.argtypes = [c_void_p, c_void_p, POINTER(c_float),
+                             c_int, c_int, c_int, c_int,
+                             POINTER(c_int32), POINTER(c_int32)]
+_lib.mg_query_v2.restype = c_int
+
+
+def slots_v2_open(directory: str, n_trees: int, n_leaves: int,
+                  slot_bytes: int):
+    """Store V2 a slots fixes (tree%05d.slt) : adressage arithmetique,
+    une vague io_uring, pas de sparse index."""
+    h = _lib.mg_slots_v2_open(directory.encode(), n_trees, n_leaves,
+                              slot_bytes)
+    if not h:
+        raise RuntimeError(f'slots_v2_open failed: {directory}')
+    return h
+
+
+def query_v2(forest, slots_h, qvec, n_probes: int, top_paths: int,
+             top_n: int = 6000, query_depth: int = 0):
+    """Requete V2 : probes pathrank (medianes, multiflip si arme) + collecte
+    slots fixes en une vague. Retourne (ids, votes, n)."""
+    q = np.ascontiguousarray(qvec, dtype=np.float32)
+    ids = np.empty(top_n, dtype=np.int32)
+    votes = np.empty(top_n, dtype=np.int32)
+    n = _lib.mg_query_v2(forest._h, slots_h,
+                         q.ctypes.data_as(POINTER(c_float)),
+                         int(n_probes), int(top_paths), int(top_n),
+                         int(query_depth),
+                         ids.ctypes.data_as(POINTER(c_int32)),
+                         votes.ctypes.data_as(POINTER(c_int32)))
+    if n < 0:
+        raise RuntimeError('mg_query_v2 failed')
+    return ids[:n], votes[:n], n
+
+
 def set_probe_multiflip(on: bool) -> None:
     """Générateur de probes multi-flip (séquence de perturbation) : dépasse
     le plafond single-flip de ~depth probes distinctes par arbre. Opt-in —

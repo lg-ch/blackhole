@@ -15,6 +15,7 @@
 #include "vec_format.h"
 #include "tquant.h"
 #include "tq1.h"
+#include "slots_v2.h"
 
 #include <roaring/roaring.h>
 #include <fcntl.h>
@@ -555,6 +556,109 @@ static int query_pathrank_core(void* h, const float* qvec,
                                        allowed,
                                        (int32_t*)out_ids, (int32_t*)out_votes);
     free(leaves);
+    return n;
+}
+
+/* ---------- Requete V2 : slots fixes, UNE vague io_uring ----------
+   Meme generation de probes que pathrank (traversal medianes + rank par
+   marge + cut top_paths, multiflip via g_probe_multiflip), mais la
+   collecte lit des SLOTS a offsets calcules (slots_v2) : pas de sparse
+   index, pas de phase fenetres. */
+void* mg_slots_v2_open(const char* dir, int n_trees, int n_leaves,
+                       int slot_bytes) {
+    return slots_v2_open(dir, n_trees, n_leaves, slot_bytes);
+}
+void mg_slots_v2_close(void* h) { slots_v2_close(h); }
+
+int mg_query_v2(void* fh, void* sh, const float* qvec,
+                int n_probes, int top_paths, int top_n, int query_depth,
+                int* out_ids, int* out_votes) {
+    if (!fh || !sh) return -1;
+    Forest* f = (Forest*)fh;
+    int nt = f->n_trees, dim = f->dim, sub = f->sub_dim, depth = f->depth;
+    int qd_eff = (query_depth > 0 && query_depth < depth) ? query_depth
+                                                          : depth;
+    int use_sub = (sub > 0 && sub <= dim);
+    if (n_probes < 0) n_probes = 0;
+    int n_sets = n_probes + 1;
+    size_t nL = (size_t)nt * (size_t)n_sets;
+    if (top_paths <= 0 || (size_t)top_paths > nL) top_paths = (int)nL;
+
+    float* qn = (float*)malloc((size_t)dim * sizeof(float));
+    int32_t* leaves = (int32_t*)malloc(nL * sizeof(int32_t));
+    int32_t* ltree = (int32_t*)malloc(nL * sizeof(int32_t));
+    PathRankEntry* rank = (PathRankEntry*)malloc(nL * sizeof(PathRankEntry));
+    if (!qn || !leaves || !ltree || !rank) {
+        free(qn); free(leaves); free(ltree); free(rank);
+        return -1;
+    }
+    float nrm = 0.0f;
+    for (int i = 0; i < dim; i++) nrm += qvec[i] * qvec[i];
+    nrm = (nrm > 0.0f) ? 1.0f / sqrtf(nrm) : 1.0f;
+    for (int i = 0; i < dim; i++) qn[i] = qvec[i] * nrm;
+
+    int32_t base = leaf_base(qd_eff);
+    for (size_t i = 0; i < nL; i++) {
+        leaves[i] = -1;
+        ltree[i] = (int32_t)(i % (size_t)nt);
+        rank[i].score = -1.0f;
+        rank[i].li = (int32_t)i;
+    }
+    #pragma omp parallel
+    {
+        float* _v0 = (float*)malloc((size_t)dim * sizeof(float));
+        float* _v1 = (float*)malloc((size_t)dim * sizeof(float));
+        int* _dims = (int*)malloc((size_t)dim * sizeof(int));
+        int32_t* _nodes = (int32_t*)malloc((size_t)n_sets * sizeof(int32_t));
+        float* _scores = (float*)malloc((size_t)n_sets * sizeof(float));
+        if (_v0 && _v1 && _dims && _nodes && _scores) {
+            #pragma omp for schedule(static)
+            for (int t = 0; t < nt; t++) {
+                int cnt;
+                traversal_set_medians(
+                    f->medians ? f->medians
+                                     + (size_t)t * ((1 << f->med_depth) - 1)
+                               : NULL,
+                    f->med_depth);
+                if (use_sub) {
+                    cnt = g_probe_multiflip
+                        ? traverse_sub_probes_multi_scored(
+                              qn, dim, sub, qd_eff, tree_seed(t),
+                              _v0, _v1, _dims, n_probes, 0,
+                              _nodes, _scores)
+                        : traverse_sub_probes_scored(
+                              qn, dim, sub, qd_eff, tree_seed(t),
+                              _v0, _v1, _dims, n_probes, 0,
+                              _nodes, _scores);
+                } else {
+                    _nodes[0] = traverse(qn, dim, qd_eff, tree_seed(t),
+                                         _v0, _v1);
+                    _scores[0] = 0.0f;
+                    cnt = 1;
+                }
+                for (int s = 0; s < n_sets; s++) {
+                    size_t li = (size_t)s * nt + t;
+                    if (s < cnt) {
+                        leaves[li] = _nodes[s] - base;
+                        rank[li].score = _scores[s];
+                        rank[li].li = (int32_t)li;
+                    }
+                }
+            }
+        }
+        free(_v0); free(_v1); free(_dims); free(_nodes); free(_scores);
+    }
+    if ((size_t)top_paths < nL) {
+        qsort(rank, nL, sizeof(PathRankEntry), pathrank_cmp_desc);
+        for (size_t i = (size_t)top_paths; i < nL; i++)
+            leaves[rank[i].li] = -1;
+    }
+    free(rank); free(qn);
+
+    int n = slots_v2_collect(sh, leaves, ltree, (int)nL, depth - qd_eff,
+                             nt, top_n, (int32_t*)out_ids,
+                             (int32_t*)out_votes);
+    free(leaves); free(ltree);
     return n;
 }
 
