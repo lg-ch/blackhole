@@ -1371,6 +1371,10 @@ int main(int argc, char** argv) {
     parse_flags(&argc, &argv);
     if (argc < 2) return usage();
     if (strcmp(argv[1], "build")     == 0) return cmd_build(argc, argv);
+    if (strcmp(argv[1], "build2")    == 0) {
+        extern int cmd_build2(int, char**);
+        return cmd_build2(argc, argv);
+    }
     if (strcmp(argv[1], "tquant")    == 0) return cmd_tquant(argc, argv);
     if (strcmp(argv[1], "tquant1")   == 0) return cmd_tquant1(argc, argv);
     if (strcmp(argv[1], "query")     == 0) return cmd_query(argc, argv);
