@@ -1,7 +1,8 @@
 /* Store V2 a slots fixes — voir slots_v2.h. Pipeline de collecte :
-   1 vague io_uring (offsets calcules, pas de phase fenetres) -> parse
-   [count][ids] -> paires (tree|doc) -> radix par doc -> votes dedup par
-   arbre -> top_n par histogramme de votes. Self-contained. */
+   1 vague io_uring (offsets calcules, pas de phase fenetres), puis
+   - qd natif (k_shift==0) : comptage hash direct (dedup structurelle) ;
+   - qd < depth : paires (tree|doc) -> radix par doc -> votes dedup par
+     arbre. Top_n par histogramme de votes dans les deux cas. */
 #define _POSIX_C_SOURCE 200809L
 #include "slots_v2.h"
 
@@ -107,6 +108,101 @@ int slots_v2_collect(void* h, const int32_t* leaves,
         if (io_uring_wait_cqe(&s->ring, &cqe) != 0) break;
         io_uring_cqe_seen(&s->ring, cqe);
         inflight--;
+    }
+
+    /* --- Chemin qd natif (k_shift==0) : une probe = une feuille exacte.
+       Un doc vit dans UNE feuille par arbre et les probes d'un meme arbre
+       sont des feuilles distinctes -> au plus une occurrence par arbre.
+       La dedup est donc structurelle : vote = comptage d'occurrences.
+       Radix u32 nu (moitie du trafic du chemin general) puis comptage de
+       runs. Le hash open-addressing a ete essaye et mesure PLUS LENT que
+       le radix sur GB10 (+12 ms a NP15), meme avec table persistante et
+       epoques : l'insertion aleatoire perd contre les passes sequentielles. */
+    if (k_shift == 0) {
+        size_t cap_docs = (size_t)n_act * (size_t)slot_cap;
+        uint32_t* docs = (uint32_t*)malloc(cap_docs * 4);
+        uint32_t* dscr = (uint32_t*)malloc(cap_docs * 4);
+        if (!docs || !dscr) {
+            free(docs); free(dscr); free(buf); free(act);
+            return -1;
+        }
+        size_t N = 0;
+        for (int a = 0; a < submitted_total; a++) {
+            const uint8_t* p = buf + (size_t)a * range_bytes;
+            uint32_t cnt;
+            memcpy(&cnt, p, 4);
+            if (cnt > (uint32_t)slot_cap) cnt = (uint32_t)slot_cap;
+            memcpy(docs + N, p + 4, (size_t)cnt * 4);
+            N += cnt;
+        }
+        free(buf); free(act);
+        if (N == 0) { free(docs); free(dscr); return 0; }
+
+        uint32_t* src32 = docs;
+        uint32_t* dst32 = dscr;
+        const int BITS[3] = {11, 11, 10};
+        const int SHIFTS[3] = {0, 11, 22};
+        const uint32_t MASKS[3] = {0x7FFu, 0x7FFu, 0x3FFu};
+        for (int pass = 0; pass < 3; pass++) {
+            int nb = 1 << BITS[pass];
+            int sh = SHIFTS[pass];
+            uint32_t mask = MASKS[pass];
+            uint32_t* hist = (uint32_t*)calloc((size_t)nb, 4);
+            if (!hist) { free(docs); free(dscr); return -1; }
+            for (size_t i = 0; i < N; i++)
+                hist[(src32[i] >> sh) & mask]++;
+            uint32_t acc = 0;
+            for (int b = 0; b < nb; b++) {
+                uint32_t c = hist[b]; hist[b] = acc; acc += c;
+            }
+            for (size_t i = 0; i < N; i++)
+                dst32[hist[(src32[i] >> sh) & mask]++] = src32[i];
+            free(hist);
+            uint32_t* t = src32; src32 = dst32; dst32 = t;
+        }
+
+        /* Comptage de runs + top_n (nd peut atteindre N : docs tous
+           singletons — allocation pleine, pas de reutilisation). */
+        typedef struct { int32_t id; int32_t vote; } IdVoteN;
+        IdVoteN* dv = (IdVoteN*)malloc(N * sizeof(IdVoteN));
+        if (!dv) { free(docs); free(dscr); return -1; }
+        uint32_t vote_hist[257] = {0};
+        const int MAX_VOTE = (n_trees < 256) ? n_trees : 256;
+        size_t nd = 0;
+        size_t i = 0;
+        while (i < N) {
+            uint32_t d = src32[i];
+            size_t j = i + 1;
+            while (j < N && src32[j] == d) j++;
+            int v = (int)(j - i);
+            if (v > MAX_VOTE) v = MAX_VOTE;
+            dv[nd++] = (IdVoteN){(int32_t)d, v};
+            vote_hist[v]++;
+            i = j;
+        }
+        int thr = MAX_VOTE;
+        long take = 0;
+        while (thr > 1 && take + (long)vote_hist[thr] <= top_n)
+            take += vote_hist[thr--];
+        /* Meme regle que le chemin general : tous les votes > seuil,
+           puis completer avec == seuil (jamais une passe premier-arrive). */
+        int topn_size = 0;
+        for (size_t u = 0; u < nd; u++) {
+            if (dv[u].vote > thr) {
+                out_ids[topn_size] = dv[u].id;
+                out_votes[topn_size] = dv[u].vote;
+                topn_size++;
+            }
+        }
+        for (size_t u = 0; u < nd && topn_size < top_n; u++) {
+            if (dv[u].vote == thr) {
+                out_ids[topn_size] = dv[u].id;
+                out_votes[topn_size] = dv[u].vote;
+                topn_size++;
+            }
+        }
+        free(dv); free(docs); free(dscr);
+        return topn_size;
     }
 
     /* --- Parse + pack (tree|doc). --- */
