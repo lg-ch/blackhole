@@ -110,6 +110,10 @@ int traverse_sub_probes(const float* vec, int full_dim, int sub_dim, int depth,
    current-tree table : set before traversing EACH tree (OMP loops included).
    NULL disables (classic sign splits).                                      */
 void traversal_set_medians(const float* table, int med_depth);
+/* Mode MED2 int8 : codes u8 (2^md - 1 par arbre) + scales du meme arbre
+   ([lo x md][span x md]). Exclusif du mode f32 (chaque set efface l'autre). */
+void traversal_set_medians8(const uint8_t* codes, const float* scales,
+                            int med_depth);
 
 /* Calibrate per-node medians for all trees from an in-RAM sample.
    sample = n_sample × full_dim floats. out_table = n_trees × (2^med_depth - 1)

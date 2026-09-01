@@ -178,11 +178,40 @@ static inline int depth_of_node(int32_t node_id) {
    (mandatory in per-tree OMP loops). NULL = classic sign splits.           */
 static __thread const float* g_med_table = NULL;
 static __thread int32_t      g_med_limit = 0;
+/* Mode MED2 int8 : codes u8 par noeud + echelles par niveau
+   (scales = [lo x md][span x md] du MEME arbre). Decode a la volee :
+   th = (code/254)*span[lvl] + lo[lvl] — bit-identique au f32 que build2
+   ecrivait (memes operations flottantes). Cout : depth FMA par descente. */
+static __thread const uint8_t* g_med8_table = NULL;
+static __thread const float*   g_med8_scale = NULL;
+static __thread int32_t        g_med8_limit = 0;
+static __thread int            g_med8_md = 0;
 void traversal_set_medians(const float* table, int med_depth) {
     g_med_table = table;
     g_med_limit = (table && med_depth > 0) ? ((1 << med_depth) - 1) : 0;
+    g_med8_table = NULL; g_med8_scale = NULL;
+    g_med8_limit = 0; g_med8_md = 0;
+}
+void traversal_set_medians8(const uint8_t* codes, const float* scales,
+                            int med_depth) {
+    g_med8_table = codes;
+    g_med8_scale = scales;
+    g_med8_limit = (codes && med_depth > 0) ? ((1 << med_depth) - 1) : 0;
+    g_med8_md = med_depth;
+    g_med_table = NULL; g_med_limit = 0;
+}
+static inline int depth_of_node_fwd(int32_t node_id) {
+    uint32_t n = (uint32_t)(node_id + 1);
+    int d = 0;
+    while (n >>= 1) d++;
+    return d;
 }
 static inline float med_th(int32_t node) {
+    if (node < g_med8_limit) {
+        int lvl = depth_of_node_fwd(node);
+        return ((float)g_med8_table[node] / 254.0f)
+               * g_med8_scale[g_med8_md + lvl] + g_med8_scale[lvl];
+    }
     return (node < g_med_limit) ? g_med_table[node] : 0.0f;
 }
 

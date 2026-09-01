@@ -1,7 +1,7 @@
 /* BUILD2 — construction V2 niveau-synchrone : medianes EXACTES par noeud
    (population entiere, pas d echantillon), snap int8 par niveau, routage
    avec le seuil snappe + tie-break hash(doc_id) sur les ex aequo, sortie
-   NATIVE v2 : medians.bin (MED1) + fichiers slots (tree%05d.slt).
+   NATIVE v2 : medians.bin (MED2 int8) + fichiers slots (tree%05d.slt).
    Ni phase paires, ni conversion srt, ni etape de calibration : les
    medianes sont un sous-produit du build.
 
@@ -21,7 +21,7 @@
 #include <string.h>
 #include <time.h>
 
-#define MED_MAGIC 0x3144454Du
+#define MED2_MAGIC 0x3244454Du
 
 static inline int tie_bit(uint32_t doc) {
     return (int)(((uint64_t)doc * 0x9E3779B97F4A7C15ull) >> 37 & 1ull);
@@ -64,7 +64,7 @@ typedef struct {
 static void level_tree(const B2* b, uint64_t ts, int level,
                        uint32_t* paths, uint32_t* perm, float* proj,
                        float* pbuf, int64_t* offs, float* raw,
-                       float* theta_out) {
+                       uint8_t* code_out, float* lo_out, float* span_out) {
     const int64_t n = b->n;
     const int64_t nk = 1ll << level;
     /* comptage + offsets */
@@ -105,13 +105,19 @@ static void level_tree(const B2* b, uint64_t ts, int level,
         if (raw[k] > hi) hi = raw[k];
     }
     float span = hi - lo;
-    /* passe B : snap + routage */
+    lo_out[level] = lo;
+    span_out[level] = span;
+    /* passe B : snap + routage. Le seuil route AVEC la valeur decodee du
+       code u8 — bit-identique a ce que la requete recalculera (MED2). */
     for (int64_t k = 0; k < nk; k++) {
         int64_t s = offs[k], e = offs[k + 1];
         float th = raw[k];
-        if (span > 0.0f)
-            th = roundf((th - lo) / span * 254.0f) / 254.0f * span + lo;
-        theta_out[(nk - 1) + k] = th;
+        uint8_t c = 0;
+        if (span > 0.0f) {
+            c = (uint8_t)roundf((th - lo) / span * 254.0f);
+            th = (float)c / 254.0f * span + lo;
+        }
+        code_out[(nk - 1) + k] = c;
         for (int64_t i = s; i < e; i++) {
             uint32_t doc = perm[i];
             int bit;
@@ -208,8 +214,10 @@ int cmd_build2(int argc, char** argv) {
 
     B2 b = {base, n, dim, sub_dim, depth, slot_bytes};
     int64_t med_nodes = (1ll << depth) - 1;
-    float* med = (float*)calloc((size_t)n_trees * med_nodes,
-                                sizeof(float));
+    uint8_t* med8 = (uint8_t*)calloc((size_t)n_trees * med_nodes, 1);
+    float* scales = (float*)calloc((size_t)n_trees * 2 * depth,
+                                   sizeof(float));
+    if (!med8 || !scales) { fprintf(stderr, "OOM medians\n"); return 1; }
     int64_t trunc_tot = 0;
     double t0 = (double)clock() / CLOCKS_PER_SEC;
 
@@ -235,7 +243,9 @@ int cmd_build2(int argc, char** argv) {
                 uint32_t* pt = paths + (size_t)j * n;
                 for (int level = 0; level < depth; level++)
                     level_tree(&b, ts, level, pt, perm, proj, pbuf,
-                               offs, raw, med + (size_t)t * med_nodes);
+                               offs, raw, med8 + (size_t)t * med_nodes,
+                               scales + (size_t)t * 2 * depth,
+                               scales + (size_t)t * 2 * depth + depth);
                 int64_t tr = 0;
                 write_slots(&b, t, pt, perm, offs, out_dir, slotbuf, &tr);
                 trunc_g += tr;
@@ -254,15 +264,16 @@ int cmd_build2(int argc, char** argv) {
     snprintf(mpath, sizeof(mpath), "%s/medians.bin", out_dir);
     FILE* mf = fopen(mpath, "wb");
     if (!mf) { perror("medians"); return 1; }
-    uint32_t mh[4] = {MED_MAGIC, (uint32_t)n_trees, (uint32_t)depth, 0};
+    uint32_t mh[4] = {MED2_MAGIC, (uint32_t)n_trees, (uint32_t)depth, 0};
     fwrite(mh, 4, 4, mf);
-    fwrite(med, sizeof(float), (size_t)n_trees * med_nodes, mf);
+    fwrite(scales, sizeof(float), (size_t)n_trees * 2 * depth, mf);
+    fwrite(med8, 1, (size_t)n_trees * med_nodes, mf);
     fclose(mf);
     fprintf(stderr,
-            "build2: DONE — medians.bin %.1f Mo, tronques %lld "
+            "build2: DONE — medians.bin MED2 %.1f Mo, tronques %lld "
             "(%.4f%%)\n",
-            (double)n_trees * med_nodes * 4 / 1e6, (long long)trunc_tot,
+            (double)n_trees * med_nodes / 1e6, (long long)trunc_tot,
             100.0 * (double)trunc_tot / ((double)n * n_trees));
-    free(med); free(base);
+    free(med8); free(scales); free(base);
     return 0;
 }

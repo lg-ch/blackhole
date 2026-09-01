@@ -328,13 +328,23 @@ int forest_open(Forest* f, const char* index_dir,
         char mpath[600];
         snprintf(mpath, sizeof(mpath), "%s/medians.bin", index_dir);
         int mnt = 0, mmd = 0;
-        float* tab = medians_load(mpath, &mnt, &mmd);
         /* mnt >= n_trees : une forêt ouverte sur un PRÉFIXE d'arbres (sous-
            forêt) utilise le préfixe de la table. Jeter les médianes ici
            ferait requêter en sign-split un index rangé aux médianes →
            stranding massif (self-vote 9/64 mesuré sur LAION-10M).        */
-        if (tab && mnt >= f->n_trees) { f->medians = tab; f->med_depth = mmd; }
-        else { free(tab); f->medians = NULL; f->med_depth = 0; }
+        f->medians = NULL; f->medians8 = NULL; f->med_scales = NULL;
+        f->med_depth = 0;
+        float* scales = NULL;
+        uint8_t* tab8 = medians8_load(mpath, &mnt, &mmd, &scales);
+        if (tab8 && mnt >= f->n_trees) {
+            f->medians8 = tab8; f->med_scales = scales; f->med_depth = mmd;
+        } else {
+            free(tab8); free(scales);
+            float* tab = medians_load(mpath, &mnt, &mmd);
+            if (tab && mnt >= f->n_trees) {
+                f->medians = tab; f->med_depth = mmd;
+            } else free(tab);
+        }
     }
     strncpy(f->index_dir, index_dir, sizeof(f->index_dir) - 1);
     f->index_dir[sizeof(f->index_dir) - 1] = '\0';
@@ -431,6 +441,8 @@ void forest_close(Forest* f) {
     free(f->bytes_buf);     f->bytes_buf     = NULL;
     free(f->byte_pos_buf);  f->byte_pos_buf  = NULL;
     free(f->medians); f->medians = NULL;
+    free(f->medians8); f->medians8 = NULL;
+    free(f->med_scales); f->med_scales = NULL;
     if (f->tombstones) {
         roaring_bitmap_free(f->tombstones);
         f->tombstones = NULL;

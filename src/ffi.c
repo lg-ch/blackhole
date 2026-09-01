@@ -513,10 +513,16 @@ static int query_pathrank_core(void* h, const float* qvec,
             #pragma omp for schedule(static)
             for (int t = 0; t < nt; t++) {
                 int cnt;
-                traversal_set_medians(
-                    f->medians ? f->medians + (size_t)t * ((1 << f->med_depth) - 1)
-                               : NULL,
-                    f->med_depth);
+                if (f->medians8)
+                    traversal_set_medians8(
+                        f->medians8 + (size_t)t * ((1 << f->med_depth) - 1),
+                        f->med_scales + (size_t)t * 2 * f->med_depth,
+                        f->med_depth);
+                else
+                    traversal_set_medians(
+                        f->medians ? f->medians + (size_t)t * ((1 << f->med_depth) - 1)
+                                   : NULL,
+                        f->med_depth);
                 if (use_sub) {
                     cnt = g_probe_multiflip
                         ? traverse_sub_probes_multi_scored(
@@ -615,11 +621,17 @@ int mg_query_v2(void* fh, void* sh, const float* qvec,
             #pragma omp for schedule(static)
             for (int t = 0; t < nt; t++) {
                 int cnt;
-                traversal_set_medians(
-                    f->medians ? f->medians
-                                     + (size_t)t * ((1 << f->med_depth) - 1)
-                               : NULL,
-                    f->med_depth);
+                if (f->medians8)
+                    traversal_set_medians8(
+                        f->medians8 + (size_t)t * ((1 << f->med_depth) - 1),
+                        f->med_scales + (size_t)t * 2 * f->med_depth,
+                        f->med_depth);
+                else
+                    traversal_set_medians(
+                        f->medians ? f->medians
+                                         + (size_t)t * ((1 << f->med_depth) - 1)
+                                   : NULL,
+                        f->med_depth);
                 if (use_sub) {
                     cnt = g_probe_multiflip
                         ? traverse_sub_probes_multi_scored(
@@ -1181,37 +1193,59 @@ unsigned int mg_varbyte_decode(const unsigned char* in, size_t* pos) {
    Load once before ingest traffic; an old table is intentionally leaked
    on reload because in-flight traversals on other threads may still read
    it (bounded: one table per reload, ~4-16 MB). */
-static const float* g_live_med       = NULL;
-static int          g_live_med_depth = 0;
-static int          g_live_med_trees = 0;
+static const float*   g_live_med       = NULL;
+static const uint8_t* g_live_med8      = NULL;
+static const float*   g_live_med8_sc   = NULL;
+static int            g_live_med_depth = 0;
+static int            g_live_med_trees = 0;
 
 int mg_live_medians_load(const char* path) {
     int nt = 0, md = 0;
+    float* scales = NULL;
+    uint8_t* tab8 = medians8_load(path, &nt, &md, &scales);
+    if (tab8) {
+        g_live_med_depth = md;
+        g_live_med_trees = nt;
+        g_live_med8      = tab8;
+        g_live_med8_sc   = scales;
+        g_live_med       = NULL;
+        return md;
+    }
     float* tab = medians_load(path, &nt, &md);
     if (!tab) return -1;
     g_live_med_depth = md;
     g_live_med_trees = nt;
     g_live_med       = tab;
+    g_live_med8      = NULL;
+    g_live_med8_sc   = NULL;
     return md;
 }
 
 void mg_live_medians_clear(void) {
     g_live_med = NULL;
+    g_live_med8 = NULL;
+    g_live_med8_sc = NULL;
     g_live_med_depth = 0;
     g_live_med_trees = 0;
 }
 
-int mg_live_medians_depth(void) { return g_live_med ? g_live_med_depth : 0; }
+int mg_live_medians_depth(void) {
+    return (g_live_med || g_live_med8) ? g_live_med_depth : 0;
+}
 
 /* Arm the thread-local median table for `tree_idx` — or explicitly reset
    it to NULL. The reset matters even without a live table : the previous
    caller on this thread (e.g. a query) may have left another tree's
    thresholds armed. */
 static inline void live_set_medians(int tree_idx) {
-    const float* t = g_live_med;
-    if (t && tree_idx >= 0 && tree_idx < g_live_med_trees) {
+    if (g_live_med8 && tree_idx >= 0 && tree_idx < g_live_med_trees) {
+        traversal_set_medians8(
+            g_live_med8 + (size_t)tree_idx * ((1u << g_live_med_depth) - 1),
+            g_live_med8_sc + (size_t)tree_idx * 2 * g_live_med_depth,
+            g_live_med_depth);
+    } else if (g_live_med && tree_idx >= 0 && tree_idx < g_live_med_trees) {
         traversal_set_medians(
-            t + (size_t)tree_idx * ((1u << g_live_med_depth) - 1),
+            g_live_med + (size_t)tree_idx * ((1u << g_live_med_depth) - 1),
             g_live_med_depth);
     } else {
         traversal_set_medians(NULL, 0);

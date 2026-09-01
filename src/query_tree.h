@@ -51,6 +51,10 @@ typedef struct {
        sign splits. Table = n_trees × (2^med_depth - 1) floats.            */
     float*         medians;
     int            med_depth;
+    /* Variante MED2 int8 (exclusive de `medians`) : codes u8 par noeud +
+       echelles par (arbre, niveau). 4x moins de RAM — voir medians8_load. */
+    uint8_t*       medians8;
+    float*         med_scales;
 
     /* io_uring registered buffer for the TQ1 stage 1 read path.
        Allocated at forest_open, registered with io_uring_register_buffers,

@@ -100,6 +100,38 @@ static int raise_fd_limit(int target) {
                       [n_trees × (2^med_depth - 1) floats]                   */
 #define MED_MAGIC 0x3144454du
 
+/* MED2 : [u32 "MED2"][u32 n_trees][u32 med_depth][u32 rsvd]
+          [n_trees x 2 x md floats : par arbre lo[md] puis span[md]]
+          [n_trees x (2^md - 1) u8 codes]
+   4x moins de RAM que MED1 (268 Mo vs 1,07 Go a 256 arbres d20) ;
+   decode bit-identique au f32 de build2 (voir traversal_set_medians8). */
+#define MED2_MAGIC 0x3244454du
+
+uint8_t* medians8_load(const char* path, int* out_n_trees,
+                       int* out_med_depth, float** out_scales) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint32_t hdr[4];
+    if (fread(hdr, 4, 4, f) != 4 || hdr[0] != MED2_MAGIC) {
+        fclose(f); return NULL;
+    }
+    int nt = (int)hdr[1], md = (int)hdr[2];
+    if (nt <= 0 || md <= 0 || md > 24) { fclose(f); return NULL; }
+    size_t ns = (size_t)nt * 2 * md;
+    size_t nc = (size_t)nt * ((1u << md) - 1);
+    float* scales = (float*)malloc(ns * sizeof(float));
+    uint8_t* codes = (uint8_t*)malloc(nc);
+    if (!scales || !codes
+        || fread(scales, sizeof(float), ns, f) != ns
+        || fread(codes, 1, nc, f) != nc) {
+        free(scales); free(codes); fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *out_n_trees = nt; *out_med_depth = md; *out_scales = scales;
+    return codes;
+}
+
 float* medians_load(const char* path, int* out_n_trees, int* out_med_depth) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
@@ -201,22 +233,28 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
     /* Top-level medians : if <index_dir>/medians.bin exists (written by
        calibrate_and_save_medians before the build), routing applies its
        thresholds — queries load the same file so doc/query routing match. */
-    float* bmed_table = NULL;
-    int    bmed_depth = 0, bmed_nodes = 0;
+    float*   bmed_table = NULL;
+    uint8_t* bmed8 = NULL;
+    float*   bmed8_scales = NULL;
+    int      bmed_depth = 0, bmed_nodes = 0;
     {
         char mpath[600];
         snprintf(mpath, sizeof(mpath), "%s/medians.bin", index_dir);
         int mnt = 0;
         int med_expect = g_total_trees > 0 ? g_total_trees : n_trees;
-        bmed_table = medians_load(mpath, &mnt, &bmed_depth);
-        if (bmed_table) {
+        bmed8 = medians8_load(mpath, &mnt, &bmed_depth, &bmed8_scales);
+        if (!bmed8) bmed_table = medians_load(mpath, &mnt, &bmed_depth);
+        if (bmed8 || bmed_table) {
             if (mnt != med_expect) {
                 fprintf(stderr, "build: medians.bin n_trees mismatch (%d vs %d), ignored\n",
                         mnt, med_expect);
-                free(bmed_table); bmed_table = NULL; bmed_depth = 0;
+                free(bmed_table); bmed_table = NULL;
+                free(bmed8); free(bmed8_scales);
+                bmed8 = NULL; bmed8_scales = NULL; bmed_depth = 0;
             } else {
                 bmed_nodes = (1 << bmed_depth) - 1;
-                fprintf(stderr, "  medians ACTIVE : depth %d (%d nodes/tree)\n",
+                fprintf(stderr, "  medians ACTIVE (%s) : depth %d (%d nodes/tree)\n",
+                        bmed8 ? "MED2 int8" : "MED1 f32",
                         bmed_depth, bmed_nodes);
             }
         }
@@ -481,9 +519,16 @@ int build_forest_ex(const char* vecs_path, int doc_offset, int n_vecs,
             #pragma omp for schedule(static)
             for (int t = 0; t < n_trees; t++) {
                 uint64_t ts = tree_seed(t + g_tree_seed_offset);
-                traversal_set_medians(
-                    bmed_table ? bmed_table + (size_t)(t + g_tree_seed_offset) * bmed_nodes : NULL,
-                    bmed_depth);
+                if (bmed8)
+                    traversal_set_medians8(
+                        bmed8 + (size_t)(t + g_tree_seed_offset) * bmed_nodes,
+                        bmed8_scales
+                            + (size_t)(t + g_tree_seed_offset) * 2 * bmed_depth,
+                        bmed_depth);
+                else
+                    traversal_set_medians(
+                        bmed_table ? bmed_table + (size_t)(t + g_tree_seed_offset) * bmed_nodes : NULL,
+                        bmed_depth);
                 for (int bb = 0; bb < batch_n; bb++) {
                     const float* vb = vec_buf + (size_t)bb * dim;
                     int32_t leaf;

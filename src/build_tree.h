@@ -115,3 +115,8 @@ int calibrate_and_save_medians(const char* vecs_path, const char* index_dir,
 /* Load medians.bin ; returns malloc'd table (n_trees × (2^md - 1) floats)
    or NULL. */
 float* medians_load(const char* path, int* out_n_trees, int* out_med_depth);
+/* MED2 int8 : renvoie les codes (n_trees x (2^md - 1) u8) et *out_scales
+   (n_trees x 2 x md floats, par arbre lo[md] puis span[md]), malloc'd.
+   NULL si le fichier n'est pas MED2 (essayer medians_load ensuite). */
+uint8_t* medians8_load(const char* path, int* out_n_trees,
+                       int* out_med_depth, float** out_scales);
