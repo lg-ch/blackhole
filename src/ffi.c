@@ -1368,13 +1368,20 @@ int mg_query_probes_scored(const float* qvec, int dim, int sub_dim, int depth,
     float v0[1024], v1[1024];
     int dims[256];
     if (sub_dim > 256 || dim > 1024 || depth > 64) return -1;
+    if (n_probes > 1024) n_probes = 1024;
     live_set_medians(tree_idx);
-    int32_t nodes[64];
-    int cnt = traverse_sub_probes_scored(qvec, dim, sub_dim, depth,
-                                          tree_seed(tree_idx),
-                                          v0, v1, dims,
-                                          n_probes, 0,
-                                          nodes, out_scores);
+    int32_t nodes[1025];
+    /* Honore le flag multi-flip comme les chemins Forest — sinon le
+       generateur single-flip sature a ~depth probes en silence.        */
+    int cnt = g_probe_multiflip
+        ? traverse_sub_probes_multi_scored(qvec, dim, sub_dim, depth,
+                                           tree_seed(tree_idx),
+                                           v0, v1, dims, n_probes, 0,
+                                           nodes, out_scores)
+        : traverse_sub_probes_scored(qvec, dim, sub_dim, depth,
+                                     tree_seed(tree_idx),
+                                     v0, v1, dims, n_probes, 0,
+                                     nodes, out_scores);
     int32_t lbase = (1 << depth) - 1;
     for (int i = 0; i < cnt; i++) out_leaves[i] = (int)(nodes[i] - lbase);
     return cnt;
