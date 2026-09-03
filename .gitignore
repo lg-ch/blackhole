@@ -41,3 +41,4 @@ rpforest
 transfer/
 datasets/
 .claude/
+claude-sessions/
