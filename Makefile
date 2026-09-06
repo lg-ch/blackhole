@@ -8,7 +8,7 @@ CORE := src/gen_vec.c src/traversal.c src/sorted_store.c src/srt_hash.c \
         src/recall.c src/croaring_io.c src/tquant.c src/tq1.c src/ffi.c \
         src/calibration.c src/slot_store.c src/slot_query.c src/hot_store.c \
         src/hot_compact.c src/hot_compact_bg.c src/hot_wal.c src/meta_store.c \
-        src/slots_v2.c src/build2.c
+        src/slots_v2.c src/build2.c src/anchor.c
 CORE_OBJ := $(CORE:.c=.o)
 SRC := $(CORE) src/main.c
 OBJ := $(SRC:.c=.o)

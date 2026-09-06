@@ -1375,6 +1375,14 @@ int main(int argc, char** argv) {
         extern int cmd_build2(int, char**);
         return cmd_build2(argc, argv);
     }
+    if (strcmp(argv[1], "abuild")    == 0) {
+        extern int cmd_anchor_build(int, char**);
+        return cmd_anchor_build(argc, argv);
+    }
+    if (strcmp(argv[1], "abench")    == 0) {
+        extern int cmd_anchor_bench(int, char**);
+        return cmd_anchor_bench(argc, argv);
+    }
     if (strcmp(argv[1], "tquant")    == 0) return cmd_tquant(argc, argv);
     if (strcmp(argv[1], "tquant1")   == 0) return cmd_tquant1(argc, argv);
     if (strcmp(argv[1], "query")     == 0) return cmd_query(argc, argv);
