@@ -147,6 +147,44 @@ static inline int32_t score_tq4(const uint8_t* code, const int8_t* qlo,
 #endif
 }
 
+/* TQ2 : 2 bits/dim (4 dims/octet, valeur stockee (q+2)&3, q in [-2,1]).
+   Decodage NEON par champs de 2 bits + 4 SDOT contre la requete
+   deinterlacee en 4 flux (dims = 0,1,2,3 mod 4).                        */
+static inline int32_t score_tq2(const uint8_t* code, const int8_t* q0,
+                                const int8_t* q1, const int8_t* q2,
+                                const int8_t* q3, int dim) {
+#if ANC_NEON && defined(__ARM_FEATURE_DOTPROD)
+    int32x4_t acc = vdupq_n_s32(0);
+    int8x16_t three = vdupq_n_s8(3), two = vdupq_n_s8(2);
+    int nb = dim / 4;
+    for (int i = 0; i + 16 <= nb; i += 16) {
+        uint8x16_t b = vld1q_u8(code + i);
+        int8x16_t d0 = vsubq_s8(vandq_s8(vreinterpretq_s8_u8(b), three), two);
+        int8x16_t d1 = vsubq_s8(vandq_s8(
+            vreinterpretq_s8_u8(vshrq_n_u8(b, 2)), three), two);
+        int8x16_t d2 = vsubq_s8(vandq_s8(
+            vreinterpretq_s8_u8(vshrq_n_u8(b, 4)), three), two);
+        int8x16_t d3 = vsubq_s8(
+            vreinterpretq_s8_u8(vshrq_n_u8(b, 6)), two);
+        acc = vdotq_s32(acc, d0, vld1q_s8(q0 + i));
+        acc = vdotq_s32(acc, d1, vld1q_s8(q1 + i));
+        acc = vdotq_s32(acc, d2, vld1q_s8(q2 + i));
+        acc = vdotq_s32(acc, d3, vld1q_s8(q3 + i));
+    }
+    return vaddvq_s32(acc);
+#else
+    int32_t s = 0;
+    for (int d = 0; d < dim; d += 4) {
+        uint8_t b = code[d >> 2];
+        s += ((int)(b & 3) - 2) * q0[d >> 2]
+           + ((int)((b >> 2) & 3) - 2) * q1[d >> 2]
+           + ((int)((b >> 4) & 3) - 2) * q2[d >> 2]
+           + ((int)((b >> 6) & 3) - 2) * q3[d >> 2];
+    }
+    return s;
+#endif
+}
+
 /* TQ1 : somme masquee des q8 aux bits leves (offset constant par requete,
    sans effet sur l ordre). 8 dims par octet via vtst.                   */
 static inline int32_t score_tq1(const uint8_t* code, const int8_t* q8,
@@ -438,6 +476,17 @@ int cmd_anchor_build(int argc, char** argv) {
                         if (q1 < -8) q1 = -8; if (q1 > 7) q1 = 7;
                         code[d >> 1] = (uint8_t)((q0 & 15) | ((q1 & 15) << 4));
                     }
+                } else if (tqbits == 2) {
+                    for (int d = 0; d < dim; d += 4) {
+                        uint8_t b = 0;
+                        for (int j = 0; j < 4; j++) {
+                            int q = (int)lrintf(r[d + j] * scale[d + j]);
+                            if (q < -2) q = -2;
+                            if (q > 1) q = 1;
+                            b |= (uint8_t)((q + 2) & 3) << (2 * j);
+                        }
+                        code[d >> 2] = b;
+                    }
                 } else { /* tq1 : bit de signe */
                     memset(code, 0, code_b);
                     for (int d = 0; d < dim; d++)
@@ -561,11 +610,18 @@ int cmd_anchor_bench(int argc, char** argv) {
     fclose(qf);
 
     struct io_uring ring;
-    io_uring_queue_init(256, &ring, 0);
+    io_uring_queue_init(1024, &ring, 0);
+    /* buffer blocs : nprobe x p99 des cellules (pas le max — une cellule
+       geante x nprobe faisait des GB), reallocation si une requete depasse */
+    uint64_t* csz = (uint64_t*)malloc((size_t)K * 8);
+    for (int k = 0; k < K; k++) csz[k] = offs[k + 1] - offs[k];
     uint64_t max_cell = 0;
     for (int k = 0; k < K; k++)
-        if (offs[k + 1] - offs[k] > max_cell) max_cell = offs[k + 1] - offs[k];
-    uint8_t* blk = (uint8_t*)malloc((size_t)nprobe * max_cell);
+        if (csz[k] > max_cell) max_cell = csz[k];
+    size_t blk_cap = (size_t)nprobe * (max_cell / 4 + 4096);
+    uint8_t* blk = (uint8_t*)malloc(blk_cap);
+    if (!blk) { fprintf(stderr, "OOM blocs\n"); return 1; }
+    free(csz);
     uint64_t* boff = (uint64_t*)malloc((size_t)nprobe * 8);
     uint64_t* blen = (uint64_t*)malloc((size_t)nprobe * 8);
     ScId* heap = (ScId*)malloc(((size_t)rerank + 1) * sizeof(ScId));
@@ -623,12 +679,25 @@ int cmd_anchor_bench(int argc, char** argv) {
         }
         double T1 = now_ms();
         /* vague io_uring : nprobe blocs */
+        uint64_t need = 0;
+        for (int c = 0; c < nprobe; c++)
+            need += offs[cand[c].id + 1] - offs[cand[c].id];
+        if (need > blk_cap) {
+            uint8_t* nb = (uint8_t*)realloc(blk, need);
+            if (!nb) { fprintf(stderr, "OOM blocs req\n"); return 1; }
+            blk = nb; blk_cap = need;
+        }
         uint64_t bo = 0;
         for (int c = 0; c < nprobe; c++) {
             int k = (int)cand[c].id;
             boff[c] = bo;
             blen[c] = offs[k + 1] - offs[k];
             struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (!sqe) {
+                io_uring_submit(&ring);
+                sqe = io_uring_get_sqe(&ring);
+                if (!sqe) { fprintf(stderr, "sqe?\n"); return 1; }
+            }
             io_uring_prep_read(sqe, bfd, blk + bo, (unsigned)blen[c],
                                (off_t)offs[k]);
             bo += blen[c];
@@ -651,12 +720,20 @@ int cmd_anchor_bench(int argc, char** argv) {
             int q = (int)lrintf(qr[d] / (qmax + 1e-9f) * 127.0f);
             q8[d] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
         }
-        /* requete reordonnee pour score_tq4 : dims paires / impaires */
+        /* requete reordonnee selon le mode : tq4 = 2 flux pair/impair,
+           tq2 = 4 flux (dims mod 4), tq1 = q8 direct.                   */
         int8_t* qlo = c8;               /* reutilise le scratch */
         int8_t* qhi = c8 + dim / 2;
-        for (int d = 0; d < dim; d += 2) {
-            qlo[d >> 1] = q8[d];
-            qhi[d >> 1] = q8[d + 1];
+        int8_t* qs2[4] = {c8, c8 + dim / 4, c8 + dim / 2,
+                          c8 + 3 * (dim / 4)};
+        if (m.tqbits == 4) {
+            for (int d = 0; d < dim; d += 2) {
+                qlo[d >> 1] = q8[d];
+                qhi[d >> 1] = q8[d + 1];
+            }
+        } else if (m.tqbits == 2) {
+            for (int d = 0; d < dim; d++)
+                qs2[d & 3][d >> 2] = q8[d];
         }
         int hn = 0;
         int64_t docs_seen = 0;
@@ -674,6 +751,9 @@ int cmd_anchor_bench(int argc, char** argv) {
                     const uint8_t* code = ent + 4;
                     float s = (m.tqbits == 4)
                         ? (float)score_tq4(code, qlo, qhi, dim)
+                        : (m.tqbits == 2)
+                        ? (float)score_tq2(code, qs2[0], qs2[1],
+                                           qs2[2], qs2[3], dim)
                         : (float)score_tq1(code, q8, dim);
                     if (ln < rerank) {
                         lh[ln].s = s;
