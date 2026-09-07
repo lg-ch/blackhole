@@ -247,12 +247,14 @@ int cmd_anchor_build(int argc, char** argv) {
     int M = 3, tqbits = 4;
     uint64_t seed = 42;
     int64_t nmax = 0;
+    const char* coarse = NULL;
     for (int i = 5; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--eps")) eps = atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--m")) M = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--tqbits")) tqbits = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--seed")) seed = strtoull(argv[i + 1], 0, 10);
         else if (!strcmp(argv[i], "--nmax")) nmax = atoll(argv[i + 1]);
+        else if (!strcmp(argv[i], "--coarse")) coarse = argv[i + 1];
     }
     if (M > 4) M = 4;
     FILE* bf = fopen(base_path, "rb");
@@ -330,6 +332,147 @@ int cmd_anchor_build(int argc, char** argv) {
             }
             fclose(af);
         }
+    }
+    /* --- assignation HIERARCHIQUE via un index existant (--coarse) :
+       les plus proches parmi les K nouvelles ancres se cherchent dans le
+       voisinage des anciennes ancres du doc. O(N x ~96) au lieu de
+       O(N x K) — c est aussi le chemin de production a 1B.             */
+    if (!skip_pass1 && coarse) {
+        AMeta om;
+        char op[1024];
+        if (meta_load(coarse, &om) != 0 || om.dim != dim || om.n != n) {
+            fprintf(stderr, "coarse: meta incompatible\n");
+            return 1;
+        }
+        int Ko = om.K, Mo = om.M;
+        snprintf(op, sizeof(op), "%s/anchors.bin", coarse);
+        FILE* f = fopen(op, "rb");
+        float* Ao = (float*)malloc((size_t)Ko * dim * 4);
+        if (!f || fread(Ao, 4, (size_t)Ko * dim, f) != (size_t)Ko * dim)
+            return 1;
+        fclose(f);
+        snprintf(op, sizeof(op), "%s/assign.bin", coarse);
+        f = fopen(op, "rb");
+        int64_t ah[2];
+        int32_t* topm_o = (int32_t*)malloc((size_t)n * Mo * 4);
+        if (!f || fread(ah, 8, 2, f) != 2 || ah[0] != n || ah[1] != Mo
+            || fread(topm_o, 4, (size_t)n * Mo, f) != (size_t)n * Mo) {
+            fprintf(stderr, "coarse: assign.bin absent/incompatible\n");
+            return 1;
+        }
+        fseeko(f, (off_t)((size_t)n * Mo * 4), SEEK_CUR); /* saute topd */
+        if (fread(sigmean, 4, dim, f) != (size_t)dim) return 1;
+        fclose(f);
+        /* table de voisinage ancienne -> nouvelles : NBR plus proches */
+        const int NBR = 64;
+        int32_t* nbrs = (int32_t*)malloc((size_t)Ko * NBR * 4);
+        double t1 = omp_get_wtime();
+        #pragma omp parallel
+        {
+            int8_t* v8 = (int8_t*)malloc(dim);
+            #pragma omp for schedule(dynamic, 16)
+            for (int ko = 0; ko < Ko; ko++) {
+                const float* v = Ao + (size_t)ko * dim;
+                float vmax = 0;
+                for (int d = 0; d < dim; d++) {
+                    float x = fabsf(v[d]);
+                    if (x > vmax) vmax = x;
+                }
+                float vq = 127.0f / (vmax + 1e-9f);
+                for (int d = 0; d < dim; d++)
+                    v8[d] = (int8_t)lrintf(v[d] * vq);
+                float bd[64];
+                int32_t bi[64];
+                for (int j = 0; j < NBR; j++) bd[j] = -2e9f;
+                for (int k = 0; k < K; k++) {
+                    float s = (float)doti8(v8, A8 + (size_t)k * dim, dim);
+                    if (s > bd[NBR - 1]) {
+                        int j = NBR - 1;
+                        while (j > 0 && s > bd[j - 1]) {
+                            bd[j] = bd[j - 1]; bi[j] = bi[j - 1]; j--;
+                        }
+                        bd[j] = s; bi[j] = k;
+                    }
+                }
+                memcpy(nbrs + (size_t)ko * NBR, bi, NBR * 4);
+            }
+            free(v8);
+        }
+        fprintf(stderr, "abuild: voisinage %dx%d en %.0fs\n", Ko, NBR,
+                omp_get_wtime() - t1);
+        /* passe docs : candidats = union des voisinages des Mo anciennes */
+        fseeko(bf, 8, SEEK_SET);
+        t1 = omp_get_wtime();
+        for (int64_t off = 0; off < n; off += CHUNK) {
+            int64_t c = n - off < CHUNK ? n - off : CHUNK;
+            if (fread(raw, (size_t)dim * 2, c, bf) != (size_t)c) return 1;
+            #pragma omp parallel
+            {
+                float* v = (float*)malloc((size_t)dim * 4);
+                int8_t* v8 = (int8_t*)malloc(dim);
+                int32_t cnd[128];
+                #pragma omp for schedule(dynamic, 64)
+                for (int64_t i = 0; i < c; i++) {
+                    int64_t g = off + i;
+                    row_f16_to_unit(raw + (size_t)i * dim, v, dim);
+                    float vmax = 0;
+                    for (int d = 0; d < dim; d++) {
+                        float x = fabsf(v[d]);
+                        if (x > vmax) vmax = x;
+                    }
+                    float vq = 127.0f / (vmax + 1e-9f);
+                    for (int d = 0; d < dim; d++)
+                        v8[d] = (int8_t)lrintf(v[d] * vq);
+                    int nc = 0;
+                    for (int mo = 0; mo < Mo; mo++) {
+                        int32_t ko = topm_o[g * Mo + mo];
+                        if (ko < 0) continue;
+                        const int32_t* nb = nbrs + (size_t)ko * NBR;
+                        for (int j = 0; j < NBR; j++) {
+                            int32_t k = nb[j];
+                            int dup = 0;
+                            for (int x = 0; x < nc; x++)
+                                if (cnd[x] == k) { dup = 1; break; }
+                            if (!dup) cnd[nc++] = k;
+                        }
+                    }
+                    float bd[4] = {2e9f, 2e9f, 2e9f, 2e9f};
+                    int32_t bi[4] = {-1, -1, -1, -1};
+                    for (int x = 0; x < nc; x++) {
+                        float d2 = -(float)doti8(
+                            v8, A8 + (size_t)cnd[x] * dim, dim);
+                        if (d2 < bd[M - 1]) {
+                            int j = M - 1;
+                            while (j > 0 && d2 < bd[j - 1]) {
+                                bd[j] = bd[j - 1]; bi[j] = bi[j - 1]; j--;
+                            }
+                            bd[j] = d2; bi[j] = cnd[x];
+                        }
+                    }
+                    float inv = 1.0f / (vq * aq);
+                    for (int j = 0; j < M; j++) {
+                        topm[g * M + j] = bi[j];
+                        topd[g * M + j] = 2.0f + 2.0f * bd[j] * inv;
+                    }
+                }
+                free(v); free(v8);
+            }
+            if (off % 4000000 == 0)
+                fprintf(stderr, "abuild: coarse-assign %lld/%lld (%.0fs)\n",
+                        (long long)off, (long long)n, omp_get_wtime() - t1);
+        }
+        free(Ao); free(topm_o); free(nbrs);
+        skip_pass1 = 1;
+        FILE* af = fopen(apath, "wb");
+        if (af) {
+            int64_t h2[2] = {n, M};
+            fwrite(h2, 8, 2, af);
+            fwrite(topm, 4, (size_t)n * M, af);
+            fwrite(topd, 4, (size_t)n * M, af);
+            fwrite(sigmean, 4, dim, af);
+            fclose(af);
+        }
+        fprintf(stderr, "abuild: assignation hierarchique OK\n");
     }
     fseeko(bf, 8, SEEK_SET);
     for (int64_t off = 0; skip_pass1 == 0 && off < n; off += CHUNK) {
@@ -735,12 +878,33 @@ int cmd_anchor_bench(int argc, char** argv) {
             for (int d = 0; d < dim; d++)
                 qs2[d & 3][d >> 2] = q8[d];
         }
+        /* SCORING PROGRESSIF : pre-score sur les DIM_PRE premieres dims
+           tournees (la FWHT egalise l energie -> le prefixe porte
+           DIM_PRE/dim de la variance), preselection top-PRE_KEEP par
+           thread, puis score COMPLET des seuls survivants. CPU ~/4.    */
+        typedef struct { float s; const uint8_t* ent; } ScEnt;
+        /* min-tas binaire sur s : remplacement du minimum en O(log n)
+           (l insertion decalee coutait O(n) — mur a 16k en mono-thread) */
+        #define PH_SIFT(ph, n) do {                                      \
+            int _i = 0;                                                  \
+            for (;;) {                                                   \
+                int _l = 2 * _i + 1, _r = _l + 1, _m = _i;               \
+                if (_l < (n) && (ph)[_l].s < (ph)[_m].s) _m = _l;        \
+                if (_r < (n) && (ph)[_r].s < (ph)[_m].s) _m = _r;        \
+                if (_m == _i) break;                                     \
+                ScEnt _t = (ph)[_i]; (ph)[_i] = (ph)[_m];                \
+                (ph)[_m] = _t; _i = _m;                                  \
+            }                                                            \
+        } while (0)
+        const int DIM_PRE = (dim >= 512) ? 256 : dim;
         int hn = 0;
         int64_t docs_seen = 0;
         #pragma omp parallel reduction(+ : docs_seen)
         {
-            ScId* lh = (ScId*)malloc(sizeof(ScId) * (size_t)rerank);
-            int ln = 0;
+            int PRE_KEEP = 16384 / omp_get_num_threads();
+            if (PRE_KEEP < rerank * 4) PRE_KEEP = rerank * 4;
+            ScEnt* ph = (ScEnt*)malloc(sizeof(ScEnt) * (size_t)PRE_KEEP);
+            int pn = 0;
             #pragma omp for schedule(dynamic, 1)
             for (int c = 0; c < nprobe; c++) {
                 const uint8_t* base = blk + boff[c];
@@ -750,25 +914,52 @@ int cmd_anchor_bench(int argc, char** argv) {
                     const uint8_t* ent = base + e * ent_b;
                     const uint8_t* code = ent + 4;
                     float s = (m.tqbits == 4)
-                        ? (float)score_tq4(code, qlo, qhi, dim)
+                        ? (float)score_tq4(code, qlo, qhi, DIM_PRE)
                         : (m.tqbits == 2)
                         ? (float)score_tq2(code, qs2[0], qs2[1],
-                                           qs2[2], qs2[3], dim)
-                        : (float)score_tq1(code, q8, dim);
-                    if (ln < rerank) {
-                        lh[ln].s = s;
-                        memcpy(&lh[ln].id, ent, 4);
-                        ln++;
-                        if (ln == rerank)
-                            qsort(lh, ln, sizeof(ScId), scid_cmp);
-                    } else if (s > lh[rerank - 1].s) {
-                        int j = rerank - 1;
-                        while (j > 0 && s > lh[j - 1].s) {
-                            lh[j] = lh[j - 1]; j--;
+                                           qs2[2], qs2[3], DIM_PRE)
+                        : (float)score_tq1(code, q8, DIM_PRE);
+                    if (pn < PRE_KEEP) {
+                        /* construction : sift-up */
+                        int i2 = pn++;
+                        ph[i2].s = s; ph[i2].ent = ent;
+                        while (i2 > 0) {
+                            int p2 = (i2 - 1) / 2;
+                            if (ph[p2].s <= ph[i2].s) break;
+                            ScEnt t = ph[p2]; ph[p2] = ph[i2];
+                            ph[i2] = t; i2 = p2;
                         }
-                        lh[j].s = s;
-                        memcpy(&lh[j].id, ent, 4);
+                    } else if (s > ph[0].s) {
+                        ph[0].s = s; ph[0].ent = ent;
+                        PH_SIFT(ph, PRE_KEEP);
                     }
+                }
+            }
+            /* score complet des survivants locaux -> top-rerank local */
+            ScId* lh = (ScId*)malloc(sizeof(ScId) * (size_t)rerank);
+            int ln = 0;
+            for (int e = 0; e < pn; e++) {
+                const uint8_t* ent = ph[e].ent;
+                const uint8_t* code = ent + 4;
+                float s = (m.tqbits == 4)
+                    ? (float)score_tq4(code, qlo, qhi, dim)
+                    : (m.tqbits == 2)
+                    ? (float)score_tq2(code, qs2[0], qs2[1],
+                                       qs2[2], qs2[3], dim)
+                    : (float)score_tq1(code, q8, dim);
+                if (ln < rerank) {
+                    lh[ln].s = s;
+                    memcpy(&lh[ln].id, ent, 4);
+                    ln++;
+                    if (ln == rerank)
+                        qsort(lh, ln, sizeof(ScId), scid_cmp);
+                } else if (s > lh[rerank - 1].s) {
+                    int j = rerank - 1;
+                    while (j > 0 && s > lh[j - 1].s) {
+                        lh[j] = lh[j - 1]; j--;
+                    }
+                    lh[j].s = s;
+                    memcpy(&lh[j].id, ent, 4);
                 }
             }
             if (ln < rerank) qsort(lh, ln, sizeof(ScId), scid_cmp);
@@ -787,7 +978,7 @@ int cmd_anchor_bench(int argc, char** argv) {
                     heap[j] = lh[e];
                 } else break; /* lh trie : plus rien a inserer */
             }
-            free(lh);
+            free(ph); free(lh);
         }
         if (hn < rerank) qsort(heap, hn, sizeof(ScId), scid_cmp);
         docs_seen_tot += docs_seen;
