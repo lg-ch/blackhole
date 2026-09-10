@@ -28,6 +28,80 @@
 #define ANC_NEON 0
 #endif
 
+/* ---------- mode S3 : vagues de range-GETs paralleles (libcurl multi,
+   SigV4 natif). Cles UNIQUEMENT via l environnement AWS_ACCESS_KEY_ID /
+   AWS_SECRET_ACCESS_KEY (jamais en argv ni en fichier). ---------- */
+#include <curl/curl.h>
+typedef struct { uint8_t* dst; size_t cap; size_t got; } S3Buf;
+
+static size_t s3_write_cb(void* p, size_t s, size_t n, void* u) {
+    S3Buf* b = (S3Buf*)u;
+    size_t k = s * n;
+    if (b->got + k > b->cap) k = b->cap - b->got;
+    memcpy(b->dst + b->got, p, k);
+    b->got += k;
+    return s * n;
+}
+
+typedef struct {
+    CURLM* multi;
+    char userpwd[512];
+    int has_auth;
+} S3Ctx;
+
+static int s3_init(S3Ctx* c) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    c->multi = curl_multi_init();
+    curl_multi_setopt(c->multi, CURLMOPT_MAX_HOST_CONNECTIONS, 512L);
+    curl_multi_setopt(c->multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, 512L);
+    curl_multi_setopt(c->multi, CURLMOPT_MAXCONNECTS, 512L);
+    const char* k = getenv("AWS_ACCESS_KEY_ID");
+    const char* s = getenv("AWS_SECRET_ACCESS_KEY");
+    c->has_auth = (k && s);
+    if (c->has_auth) snprintf(c->userpwd, sizeof(c->userpwd), "%s:%s", k, s);
+    return c->multi ? 0 : -1;
+}
+
+/* n range-GETs sur `url`, [off[i], off[i]+len[i]) -> dst[i]. Renvoie le
+   nombre de reponses completes. Hedging : pas encore (v1).            */
+static int s3_wave(S3Ctx* c, const char* url, const uint64_t* off,
+                   const uint64_t* len, uint8_t* const* dst, int n) {
+    CURL** hs = (CURL**)malloc(sizeof(CURL*) * (size_t)n);
+    S3Buf* bufs = (S3Buf*)malloc(sizeof(S3Buf) * (size_t)n);
+    char rng[64];
+    for (int i = 0; i < n; i++) {
+        hs[i] = curl_easy_init();
+        bufs[i].dst = dst[i]; bufs[i].cap = (size_t)len[i]; bufs[i].got = 0;
+        snprintf(rng, sizeof(rng), "%llu-%llu", (unsigned long long)off[i],
+                 (unsigned long long)(off[i] + len[i] - 1));
+        curl_easy_setopt(hs[i], CURLOPT_URL, url);
+        curl_easy_setopt(hs[i], CURLOPT_RANGE, rng);
+        curl_easy_setopt(hs[i], CURLOPT_WRITEFUNCTION, s3_write_cb);
+        curl_easy_setopt(hs[i], CURLOPT_WRITEDATA, &bufs[i]);
+        curl_easy_setopt(hs[i], CURLOPT_TCP_KEEPALIVE, 1L);
+        if (c->has_auth) {
+            curl_easy_setopt(hs[i], CURLOPT_AWS_SIGV4, "aws:amz:us-east-1:s3");
+            curl_easy_setopt(hs[i], CURLOPT_USERPWD, c->userpwd);
+        }
+        curl_multi_add_handle(c->multi, hs[i]);
+    }
+    int running = 1;
+    while (running) {
+        curl_multi_perform(c->multi, &running);
+        if (running) curl_multi_poll(c->multi, NULL, 0, 1000, NULL);
+    }
+    int ok = 0;
+    for (int i = 0; i < n; i++) {
+        long code = 0;
+        curl_easy_getinfo(hs[i], CURLINFO_RESPONSE_CODE, &code);
+        if (code == 206 || code == 200) ok++;
+        curl_multi_remove_handle(c->multi, hs[i]);
+        curl_easy_cleanup(hs[i]);
+    }
+    free(hs); free(bufs);
+    return ok;
+}
+
 /* ---------- PRNG splitmix64 ---------- */
 static uint64_t asm64(uint64_t* st) {
     uint64_t z = (*st += 0x9E3779B97F4A7C15ULL);
@@ -724,9 +798,20 @@ int cmd_anchor_bench(int argc, char** argv) {
     int rerank = atoi(argv[7]);
     const char* outp = NULL;
     const char* drop = NULL;
+    const char* s3url = NULL;   /* ex: http://127.0.0.1:9000/wikiit */
     for (int i = 8; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--out")) outp = argv[i + 1];
         else if (!strcmp(argv[i], "--drop")) drop = argv[i + 1];
+        else if (!strcmp(argv[i], "--s3")) s3url = argv[i + 1];
+    }
+    S3Ctx s3;
+    char s3_blocks[1024], s3_base[1024];
+    if (s3url) {
+        if (s3_init(&s3) != 0) { fprintf(stderr, "curl init?\n"); return 1; }
+        snprintf(s3_blocks, sizeof(s3_blocks), "%s/blocks.bin", s3url);
+        snprintf(s3_base, sizeof(s3_base), "%s/base.f16bin", s3url);
+        fprintf(stderr, "mode S3 : %s (auth %s)\n", s3url,
+                s3.has_auth ? "SigV4" : "aucune");
     }
     AMeta m;
     if (meta_load(dir, &m) != 0) { fprintf(stderr, "meta?\n"); return 1; }
@@ -756,7 +841,7 @@ int cmd_anchor_bench(int argc, char** argv) {
     snprintf(p, sizeof(p), "%s/blocks.bin", dir);
     int bfd = open(p, O_RDONLY);
     int basefd = open(base_path, O_RDONLY);
-    if (bfd < 0 || basefd < 0) { perror("open"); return 1; }
+    if (!s3url && (bfd < 0 || basefd < 0)) { perror("open"); return 1; }
 
     FILE* qf = fopen(qpath, "rb");
     uint32_t qh[2];
@@ -872,6 +957,22 @@ int cmd_anchor_bench(int argc, char** argv) {
             blk = nb; blk_cap = need;
         }
         uint64_t bo = 0;
+        if (s3url) {
+            uint64_t* soff = (uint64_t*)malloc((size_t)nprobe * 8);
+            uint8_t** sdst = (uint8_t**)malloc((size_t)nprobe * sizeof(void*));
+            for (int c = 0; c < nprobe; c++) {
+                int k = (int)cand[c].id;
+                boff[c] = bo;
+                blen[c] = offs[k + 1] - offs[k];
+                soff[c] = offs[k];
+                sdst[c] = blk + bo;
+                bo += blen[c];
+            }
+            int ok = s3_wave(&s3, s3_blocks, soff, blen, sdst, nprobe);
+            if (ok < nprobe && qi == 0)
+                fprintf(stderr, "S3 : %d/%d blocs recus\n", ok, nprobe);
+            free(soff); free(sdst);
+        } else {
         for (int c = 0; c < nprobe; c++) {
             int k = (int)cand[c].id;
             boff[c] = bo;
@@ -891,6 +992,7 @@ int cmd_anchor_bench(int argc, char** argv) {
             struct io_uring_cqe* cqe;
             io_uring_wait_cqe(&ring, &cqe);
             io_uring_cqe_seen(&ring, cqe);
+        }
         }
         double T2 = now_ms();
         /* scoring TQ : rotation requete + int8, top-rerank */
@@ -1041,6 +1143,18 @@ int cmd_anchor_bench(int argc, char** argv) {
         }
         uint8_t* rows = rows_all;
         int inflight = 0;
+        if (s3url) {
+            uint64_t* roff = (uint64_t*)malloc((size_t)nf * 8);
+            uint64_t* rlen = (uint64_t*)malloc((size_t)nf * 8);
+            uint8_t** rdst = (uint8_t**)malloc((size_t)nf * sizeof(void*));
+            for (int e = 0; e < nf; e++) {
+                roff[e] = 8 + (uint64_t)fin[e].id * dim * 2;
+                rlen[e] = (uint64_t)dim * 2;
+                rdst[e] = rows + (size_t)e * dim * 2;
+            }
+            s3_wave(&s3, s3_base, roff, rlen, rdst, nf);
+            free(roff); free(rlen); free(rdst);
+        } else
         for (int e = 0; e < nf; e++) {
             struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
             if (!sqe) {

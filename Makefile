@@ -1,6 +1,6 @@
 CC      := gcc
 CFLAGS  := -O3 -march=armv8.2-a+dotprod+fp16 -mtune=native -fPIC -Wall -Wextra -Wno-unused-parameter -std=c11 -fopenmp
-LDFLAGS := -lm -fopenmp -luring -lroaring -lxxhash -lpthread
+LDFLAGS := -lm -fopenmp -luring -lroaring -lxxhash -lpthread -lcurl
 
 # Core .o's (no main, no top-level cmd). Used by both binary and .so.
 CORE := src/gen_vec.c src/traversal.c src/sorted_store.c src/srt_hash.c \
