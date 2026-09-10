@@ -187,27 +187,33 @@ static inline int32_t score_tq2(const uint8_t* code, const int8_t* q0,
 
 /* TQ1 : somme masquee des q8 aux bits leves (offset constant par requete,
    sans effet sur l ordre). 8 dims par octet via vtst.                   */
-static inline int32_t score_tq1(const uint8_t* code, const int8_t* q8,
-                                int dim) {
+/* TQ1 sur le motif TQ2 (qui est rapide) : 8 flux de bits extraits par
+   decalage+AND, SDOT contre la requete deinterlacee en 8 flux
+   (flux b = dims congrues a b mod 8). qs1 : 8 flux contigus de `stride`
+   octets chacun ; `dim` = dims a traiter (prefixe ou tout).           */
+static inline int32_t score_tq1(const uint8_t* code, const int8_t* qs1,
+                                int stride, int dim) {
 #if ANC_NEON && defined(__ARM_FEATURE_DOTPROD)
-    static const uint8_t bitsel[16] = {1, 2, 4, 8, 16, 32, 64, 128,
-                                       1, 2, 4, 8, 16, 32, 64, 128};
-    uint8x16_t sel = vld1q_u8(bitsel);
-    int8x16_t one = vdupq_n_s8(1);
     int32x4_t acc = vdupq_n_s32(0);
-    for (int d = 0; d + 16 <= dim; d += 16) {
-        uint8_t b0 = code[d >> 3], b1 = code[(d >> 3) + 1];
-        uint8x16_t bb = vcombine_u8(vdup_n_u8(b0), vdup_n_u8(b1));
-        uint8x16_t msk = vtstq_u8(bb, sel);
-        int8x16_t v = vandq_s8(vld1q_s8(q8 + d),
-                               vreinterpretq_s8_u8(msk));
-        acc = vdotq_s32(acc, v, one);
+    int8x16_t one = vdupq_n_s8(1);
+    int nb = dim / 8;
+    for (int i = 0; i + 16 <= nb; i += 16) {
+        uint8x16_t b = vld1q_u8(code + i);
+        /* deroule explicitement les 8 decalages (vshrq_n exige une cst) */
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(b, vreinterpretq_u8_s8(one))), vld1q_s8(qs1 + 0 * stride + i));
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b, 1), vreinterpretq_u8_s8(one))), vld1q_s8(qs1 + 1 * stride + i));
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b, 2), vreinterpretq_u8_s8(one))), vld1q_s8(qs1 + 2 * stride + i));
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b, 3), vreinterpretq_u8_s8(one))), vld1q_s8(qs1 + 3 * stride + i));
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b, 4), vreinterpretq_u8_s8(one))), vld1q_s8(qs1 + 4 * stride + i));
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b, 5), vreinterpretq_u8_s8(one))), vld1q_s8(qs1 + 5 * stride + i));
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(b, 6), vreinterpretq_u8_s8(one))), vld1q_s8(qs1 + 6 * stride + i));
+        acc = vdotq_s32(acc, vreinterpretq_s8_u8(vshrq_n_u8(b, 7)), vld1q_s8(qs1 + 7 * stride + i));
     }
     return vaddvq_s32(acc);
 #else
     int32_t s = 0;
     for (int d = 0; d < dim; d++)
-        if ((code[d >> 3] >> (d & 7)) & 1) s += q8[d];
+        if ((code[d >> 3] >> (d & 7)) & 1) s += qs1[(d & 7) * stride + (d >> 3)];
     return s;
 #endif
 }
@@ -217,6 +223,7 @@ typedef struct {
     float eps;
     int64_t n;
     uint64_t seed;
+    int cdim;   /* dims couvertes par le code stocke (layout leger) */
 } AMeta;
 
 static int meta_load(const char* dir, AMeta* m) {
@@ -225,11 +232,13 @@ static int meta_load(const char* dir, AMeta* m) {
     FILE* f = fopen(p, "r");
     if (!f) return -1;
     long long n = 0; unsigned long long sd = 0;
-    int r = fscanf(f, "%d %d %d %d %f %lld %llu", &m->K, &m->dim, &m->M,
-                   &m->tqbits, &m->eps, &n, &sd);
+    int cd = 0;
+    int r = fscanf(f, "%d %d %d %d %f %lld %llu %d", &m->K, &m->dim, &m->M,
+                   &m->tqbits, &m->eps, &n, &sd, &cd);
     fclose(f);
     m->n = n; m->seed = sd;
-    return r == 7 ? 0 : -1;
+    m->cdim = (r >= 8 && cd > 0) ? cd : m->dim;
+    return r >= 7 ? 0 : -1;
 }
 
 /* ================= BUILD ================= */
@@ -247,6 +256,7 @@ int cmd_anchor_build(int argc, char** argv) {
     int M = 3, tqbits = 4;
     uint64_t seed = 42;
     int64_t nmax = 0;
+    int cdim = 0;
     const char* coarse = NULL;
     for (int i = 5; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--eps")) eps = atof(argv[i + 1]);
@@ -255,6 +265,7 @@ int cmd_anchor_build(int argc, char** argv) {
         else if (!strcmp(argv[i], "--seed")) seed = strtoull(argv[i + 1], 0, 10);
         else if (!strcmp(argv[i], "--nmax")) nmax = atoll(argv[i + 1]);
         else if (!strcmp(argv[i], "--coarse")) coarse = argv[i + 1];
+        else if (!strcmp(argv[i], "--cdim")) cdim = atoi(argv[i + 1]);
     }
     if (M > 4) M = 4;
     FILE* bf = fopen(base_path, "rb");
@@ -560,7 +571,8 @@ int cmd_anchor_build(int argc, char** argv) {
             entries++;
         }
     }
-    int code_b = dim * tqbits / 8;
+    if (cdim <= 0 || cdim > dim) cdim = dim;
+    int code_b = cdim * tqbits / 8;
     int ent_b = 4 + code_b;
     uint64_t* offs = (uint64_t*)malloc(((size_t)K + 1) * 8);
     offs[0] = 0;
@@ -612,7 +624,7 @@ int cmd_anchor_build(int argc, char** argv) {
                 row_f16_to_unit(raw + (size_t)i * dim, v, dim);
                 rot_seeded(v, r, sgn, dim);
                 if (tqbits == 4) {
-                    for (int d = 0; d < dim; d += 2) {
+                    for (int d = 0; d < cdim; d += 2) {
                         int q0 = (int)lrintf(r[d] * scale[d]);
                         int q1 = (int)lrintf(r[d + 1] * scale[d + 1]);
                         if (q0 < -8) q0 = -8; if (q0 > 7) q0 = 7;
@@ -620,7 +632,7 @@ int cmd_anchor_build(int argc, char** argv) {
                         code[d >> 1] = (uint8_t)((q0 & 15) | ((q1 & 15) << 4));
                     }
                 } else if (tqbits == 2) {
-                    for (int d = 0; d < dim; d += 4) {
+                    for (int d = 0; d < cdim; d += 4) {
                         uint8_t b = 0;
                         for (int j = 0; j < 4; j++) {
                             int q = (int)lrintf(r[d + j] * scale[d + j]);
@@ -632,7 +644,7 @@ int cmd_anchor_build(int argc, char** argv) {
                     }
                 } else { /* tq1 : bit de signe */
                     memset(code, 0, code_b);
-                    for (int d = 0; d < dim; d++)
+                    for (int d = 0; d < cdim; d++)
                         if (r[d] >= 0) code[d >> 3] |= (uint8_t)(1 << (d & 7));
                 }
                 /* copie vers chaque entree du doc */
@@ -672,8 +684,8 @@ int cmd_anchor_build(int argc, char** argv) {
     fwrite(scale, 4, dim, fo); fclose(fo);
     snprintf(p, sizeof(p), "%s/meta.txt", out);
     fo = fopen(p, "w");
-    fprintf(fo, "%d %d %d %d %.4f %lld %llu\n", K, dim, M, tqbits, eps,
-            (long long)n, (unsigned long long)seed);
+    fprintf(fo, "%d %d %d %d %.4f %lld %llu %d\n", K, dim, M, tqbits, eps,
+            (long long)n, (unsigned long long)seed, cdim);
     fclose(fo);
     fprintf(stderr, "abuild: DONE\n");
     fclose(bf);
@@ -684,6 +696,7 @@ int cmd_anchor_build(int argc, char** argv) {
 
 /* ================= BENCH (query + latences) ================= */
 typedef struct { float s; uint32_t id; } ScId;
+typedef struct { float s; const uint8_t* ent; } ScEnt;
 
 static int scid_cmp(const void* a, const void* b) {
     float d = ((const ScId*)b)->s - ((const ScId*)a)->s;
@@ -718,7 +731,8 @@ int cmd_anchor_bench(int argc, char** argv) {
     AMeta m;
     if (meta_load(dir, &m) != 0) { fprintf(stderr, "meta?\n"); return 1; }
     int dim = m.dim, K = m.K;
-    int code_b = dim * m.tqbits / 8;
+    int cdim = m.cdim;
+    int code_b = cdim * m.tqbits / 8;
     int ent_b = 4 + code_b;
     char p[1024];
     snprintf(p, sizeof(p), "%s/anchors.bin", dir);
@@ -758,16 +772,43 @@ int cmd_anchor_bench(int argc, char** argv) {
        geante x nprobe faisait des GB), reallocation si une requete depasse */
     uint64_t* csz = (uint64_t*)malloc((size_t)K * 8);
     for (int k = 0; k < K; k++) csz[k] = offs[k + 1] - offs[k];
-    uint64_t max_cell = 0;
-    for (int k = 0; k < K; k++)
-        if (csz[k] > max_cell) max_cell = csz[k];
-    size_t blk_cap = (size_t)nprobe * (max_cell / 4 + 4096);
+    /* dimensionne au p99 x2 des cellules et PRE-TOUCHE : un buffer
+       realloue/refaulte a chaque requete coutait ~90 ms de noyau
+       (copy_to_user + clear_page) en mono-thread — vu au perf.        */
+    uint64_t* csrt = (uint64_t*)malloc((size_t)K * 8);
+    memcpy(csrt, csz, (size_t)K * 8);
+    for (int i = 1; i < K; i++) {           /* tri insertion partiel suffit */
+        uint64_t v = csrt[i]; int j = i - 1;
+        while (j >= 0 && csrt[j] > v) { csrt[j + 1] = csrt[j]; j--; }
+        csrt[j + 1] = v;
+        if (i > 20000) break;
+    }
+    uint64_t p99 = csrt[(int)(K * 0.99)];
+    if (K > 20000) { /* tri partiel invalide au-dela : prend le max/2 */
+        uint64_t mx = 0;
+        for (int k = 0; k < K; k++) if (csz[k] > mx) mx = csz[k];
+        p99 = mx / 2;
+    }
+    free(csrt);
+    size_t blk_cap = (size_t)nprobe * (p99 * 2 + 65536);
     uint8_t* blk = (uint8_t*)malloc(blk_cap);
     if (!blk) { fprintf(stderr, "OOM blocs\n"); return 1; }
+    memset(blk, 0, blk_cap);                /* pre-fault des pages */
     free(csz);
     uint64_t* boff = (uint64_t*)malloc((size_t)nprobe * 8);
     uint64_t* blen = (uint64_t*)malloc((size_t)nprobe * 8);
     ScId* heap = (ScId*)malloc(((size_t)rerank + 1) * sizeof(ScId));
+    /* scratchs persistants (alloues + pre-touches UNE fois) */
+    int nth = omp_get_max_threads();
+    size_t ph_stride = (size_t)(16384 > rerank * 4 ? 16384 : rerank * 4);
+    ScEnt* ph_all = (ScEnt*)malloc((size_t)nth * ph_stride * sizeof(ScEnt));
+    ScId* lh_all = (ScId*)malloc((size_t)nth * rerank * sizeof(ScId));
+    ScId* fin_all = (ScId*)malloc((size_t)rerank * sizeof(ScId));
+    uint8_t* rows_all = (uint8_t*)malloc((size_t)rerank * dim * 2 + 16);
+    if (!ph_all || !lh_all || !fin_all || !rows_all) return 1;
+    memset(ph_all, 0, (size_t)nth * ph_stride * sizeof(ScEnt));
+    memset(lh_all, 0, (size_t)nth * rerank * sizeof(ScId));
+    memset(rows_all, 0, (size_t)rerank * dim * 2 + 16);
     uint32_t* out_ids = (uint32_t*)malloc((size_t)nq * 11 * 4);
     double *t_anc = malloc(nq * 8), *t_io = malloc(nq * 8),
            *t_sc = malloc(nq * 8), *t_rr = malloc(nq * 8),
@@ -877,12 +918,14 @@ int cmd_anchor_bench(int argc, char** argv) {
         } else if (m.tqbits == 2) {
             for (int d = 0; d < dim; d++)
                 qs2[d & 3][d >> 2] = q8[d];
+        } else { /* tq1 : 8 flux de cdim/8 octets (flux b = dims = b mod 8) */
+            for (int d = 0; d < cdim; d++)
+                c8[(d & 7) * (cdim / 8) + (d >> 3)] = q8[d];
         }
         /* SCORING PROGRESSIF : pre-score sur les DIM_PRE premieres dims
            tournees (la FWHT egalise l energie -> le prefixe porte
            DIM_PRE/dim de la variance), preselection top-PRE_KEEP par
            thread, puis score COMPLET des seuls survivants. CPU ~/4.    */
-        typedef struct { float s; const uint8_t* ent; } ScEnt;
         /* min-tas binaire sur s : remplacement du minimum en O(log n)
            (l insertion decalee coutait O(n) — mur a 16k en mono-thread) */
         #define PH_SIFT(ph, n) do {                                      \
@@ -896,14 +939,15 @@ int cmd_anchor_bench(int argc, char** argv) {
                 (ph)[_m] = _t; _i = _m;                                  \
             }                                                            \
         } while (0)
-        const int DIM_PRE = (dim >= 512) ? 256 : dim;
+        const int DIM_PRE = (cdim >= 512) ? 256 : cdim;
         int hn = 0;
         int64_t docs_seen = 0;
         #pragma omp parallel reduction(+ : docs_seen)
         {
             int PRE_KEEP = 16384 / omp_get_num_threads();
             if (PRE_KEEP < rerank * 4) PRE_KEEP = rerank * 4;
-            ScEnt* ph = (ScEnt*)malloc(sizeof(ScEnt) * (size_t)PRE_KEEP);
+            /* scratch persistant par thread (pas de malloc par requete) */
+            ScEnt* ph = ph_all + (size_t)omp_get_thread_num() * ph_stride;
             int pn = 0;
             #pragma omp for schedule(dynamic, 1)
             for (int c = 0; c < nprobe; c++) {
@@ -918,7 +962,7 @@ int cmd_anchor_bench(int argc, char** argv) {
                         : (m.tqbits == 2)
                         ? (float)score_tq2(code, qs2[0], qs2[1],
                                            qs2[2], qs2[3], DIM_PRE)
-                        : (float)score_tq1(code, q8, DIM_PRE);
+                        : (float)score_tq1(code, c8, cdim / 8, DIM_PRE);
                     if (pn < PRE_KEEP) {
                         /* construction : sift-up */
                         int i2 = pn++;
@@ -936,17 +980,17 @@ int cmd_anchor_bench(int argc, char** argv) {
                 }
             }
             /* score complet des survivants locaux -> top-rerank local */
-            ScId* lh = (ScId*)malloc(sizeof(ScId) * (size_t)rerank);
+            ScId* lh = lh_all + (size_t)omp_get_thread_num() * rerank;
             int ln = 0;
             for (int e = 0; e < pn; e++) {
                 const uint8_t* ent = ph[e].ent;
                 const uint8_t* code = ent + 4;
                 float s = (m.tqbits == 4)
-                    ? (float)score_tq4(code, qlo, qhi, dim)
+                    ? (float)score_tq4(code, qlo, qhi, cdim)
                     : (m.tqbits == 2)
                     ? (float)score_tq2(code, qs2[0], qs2[1],
-                                       qs2[2], qs2[3], dim)
-                    : (float)score_tq1(code, q8, dim);
+                                       qs2[2], qs2[3], cdim)
+                    : (float)score_tq1(code, c8, cdim / 8, cdim);
                 if (ln < rerank) {
                     lh[ln].s = s;
                     memcpy(&lh[ln].id, ent, 4);
@@ -978,33 +1022,56 @@ int cmd_anchor_bench(int argc, char** argv) {
                     heap[j] = lh[e];
                 } else break; /* lh trie : plus rien a inserer */
             }
-            free(ph); free(lh);
         }
         if (hn < rerank) qsort(heap, hn, sizeof(ScId), scid_cmp);
         docs_seen_tot += docs_seen;
         double T3 = now_ms();
         /* rerank exact : pread f16 */
+        /* rerank exact en UNE vague io_uring (les preads sequentiels
+           coutaient 12-13 ms pour 300 lignes ; en vague ~2-3 ms) */
         int nr = hn < rerank ? hn : rerank;
-        ScId* fin = (ScId*)malloc(sizeof(ScId) * (size_t)nr);
+        ScId* fin = fin_all;
         int nf = 0;
         for (int e = 0; e < nr; e++) {
             uint32_t id = heap[e].id;
             int dup = 0;
             for (int x = 0; x < nf; x++)
                 if (fin[x].id == id) { dup = 1; break; }
-            if (dup) continue;
-            if (pread(basefd, vrow, (size_t)dim * 2,
-                      8 + (int64_t)id * dim * 2) != (int64_t)dim * 2)
-                continue;
-            row_f16_to_unit(vrow, vf, dim);
-            fin[nf].id = id;
-            fin[nf].s = dotf(qn, vf, dim);
-            nf++;
+            if (!dup) fin[nf++].id = id;
+        }
+        uint8_t* rows = rows_all;
+        int inflight = 0;
+        for (int e = 0; e < nf; e++) {
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (!sqe) {
+                io_uring_submit(&ring);
+                struct io_uring_cqe* cqe;
+                while (inflight > 0 && io_uring_wait_cqe(&ring, &cqe) == 0) {
+                    io_uring_cqe_seen(&ring, cqe); inflight--;
+                }
+                sqe = io_uring_get_sqe(&ring);
+                if (!sqe) { fprintf(stderr, "sqe rerank?\n"); return 1; }
+            }
+            io_uring_prep_read(sqe, basefd, rows + (size_t)e * dim * 2,
+                               (unsigned)(dim * 2),
+                               (off_t)(8 + (int64_t)fin[e].id * dim * 2));
+            inflight++;
+        }
+        io_uring_submit(&ring);
+        while (inflight > 0) {
+            struct io_uring_cqe* cqe;
+            if (io_uring_wait_cqe(&ring, &cqe) != 0) break;
+            io_uring_cqe_seen(&ring, cqe);
+            inflight--;
+        }
+        for (int e = 0; e < nf; e++) {
+            row_f16_to_unit((const uint16_t*)(rows + (size_t)e * dim * 2),
+                            vf, dim);
+            fin[e].s = dotf(qn, vf, dim);
         }
         qsort(fin, nf, sizeof(ScId), scid_cmp);
         for (int e = 0; e < 11; e++)
             out_ids[qi * 11 + e] = e < nf ? fin[e].id : 0xFFFFFFFFu;
-        free(fin);
         double T4 = now_ms();
         t_anc[qi] = T1 - T0; t_io[qi] = T2 - T1;
         t_sc[qi] = T3 - T2; t_rr[qi] = T4 - T3; t_tot[qi] = T4 - T0;

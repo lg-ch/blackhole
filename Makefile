@@ -1,5 +1,5 @@
 CC      := gcc
-CFLAGS  := -O3 -march=native -fPIC -Wall -Wextra -Wno-unused-parameter -std=c11 -fopenmp
+CFLAGS  := -O3 -march=armv8.2-a+dotprod+fp16 -mtune=native -fPIC -Wall -Wextra -Wno-unused-parameter -std=c11 -fopenmp
 LDFLAGS := -lm -fopenmp -luring -lroaring -lxxhash -lpthread
 
 # Core .o's (no main, no top-level cmd). Used by both binary and .so.
