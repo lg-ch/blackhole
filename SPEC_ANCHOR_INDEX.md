@@ -271,7 +271,7 @@ avec 41 Go de RAM ; DiskANN 1B ≈ 64 Go de RAM, lectures séquentielles
 
 ---
 
-## Annexe — la forêt RP (design précédent, prouvé à 1B)
+## Annexe — la forêt RP (design précédent, prouvé à 1B ; spécification complète et mesures dans `SPEC_RP_FOREST.md`)
 
 256 arbres d'hyperplans seedés (sign-split ou médianes échantillonnées
 `med_depth ≈ log2(N/2000)`), feuilles varbyte triées, multi-probe par
