@@ -47,7 +47,16 @@ typedef struct {
     CURLM* multi;
     char userpwd[512];
     int has_auth;
+    int hedge_ms;       /* 0 = pas de hedging */
+    int last_hedged;    /* GETs doubles lors de la derniere vague */
+    long last_newconn;  /* connexions TCP ouvertes (0 = tout reutilise) */
 } S3Ctx;
+
+static double now_ms_s3(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 static int s3_init(S3Ctx* c) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -85,20 +94,74 @@ static int s3_wave(S3Ctx* c, const char* url, const uint64_t* off,
         }
         curl_multi_add_handle(c->multi, hs[i]);
     }
+    /* HEDGING sur deadline : quand la vague depasse hedge_ms sans etre
+       complete, les GETs encore en vol sont DOUBLES (nouvelle connexion,
+       meme plage) ; le premier arrive gagne. Tue la queue p99 des SSD
+       objets / du WAN sans attendre les trainards.                     */
+    int hedge_ms = c->hedge_ms > 0 ? c->hedge_ms : 100000;
+    CURL** hh = (CURL**)calloc((size_t)n, sizeof(CURL*));
+    S3Buf* hb = (S3Buf*)calloc((size_t)n, sizeof(S3Buf));
+    uint8_t** hmem = (uint8_t**)calloc((size_t)n, sizeof(uint8_t*));
+    int hedged = 0;
+    double t0 = now_ms_s3();
     int running = 1;
+    int hedge_done = 0;
     while (running) {
         curl_multi_perform(c->multi, &running);
-        if (running) curl_multi_poll(c->multi, NULL, 0, 1000, NULL);
+        if (!running) break;
+        if (!hedge_done && now_ms_s3() - t0 > hedge_ms) {
+            hedge_done = 1;
+            for (int i = 0; i < n; i++) {
+                if (bufs[i].got >= bufs[i].cap) continue;   /* deja recu */
+                hmem[i] = (uint8_t*)malloc(bufs[i].cap);
+                hb[i].dst = hmem[i]; hb[i].cap = bufs[i].cap; hb[i].got = 0;
+                hh[i] = curl_easy_init();
+                snprintf(rng, sizeof(rng), "%llu-%llu",
+                         (unsigned long long)off[i],
+                         (unsigned long long)(off[i] + len[i] - 1));
+                curl_easy_setopt(hh[i], CURLOPT_URL, url);
+                curl_easy_setopt(hh[i], CURLOPT_RANGE, rng);
+                curl_easy_setopt(hh[i], CURLOPT_WRITEFUNCTION, s3_write_cb);
+                curl_easy_setopt(hh[i], CURLOPT_WRITEDATA, &hb[i]);
+                /* sur connexion CHAUDE du pool : un hedge en connexion
+                   neuve paie handshake + slow-start et ne gagne jamais */
+                if (c->has_auth) {
+                    curl_easy_setopt(hh[i], CURLOPT_AWS_SIGV4,
+                                     "aws:amz:us-east-1:s3");
+                    curl_easy_setopt(hh[i], CURLOPT_USERPWD, c->userpwd);
+                }
+                curl_multi_add_handle(c->multi, hh[i]);
+                hedged++;
+            }
+        }
+        /* fin anticipee : chaque plage recue par l un OU l autre */
+        int all = 1;
+        for (int i = 0; i < n; i++)
+            if (bufs[i].got < bufs[i].cap && !(hh[i] && hb[i].got >= hb[i].cap)) {
+                all = 0; break;
+            }
+        if (all) break;
+        curl_multi_poll(c->multi, NULL, 0, 20, NULL);
     }
     int ok = 0;
+    long newconn = 0;
     for (int i = 0; i < n; i++) {
-        long code = 0;
-        curl_easy_getinfo(hs[i], CURLINFO_RESPONSE_CODE, &code);
-        if (code == 206 || code == 200) ok++;
+        long nc = 0;
+        curl_easy_getinfo(hs[i], CURLINFO_NUM_CONNECTS, &nc);
+        newconn += nc;                 /* 0 = connexion reutilisee */
+        if (bufs[i].got >= bufs[i].cap) ok++;
+        else if (hh[i] && hb[i].got >= hb[i].cap) {
+            memcpy(bufs[i].dst, hmem[i], bufs[i].cap); ok++;
+        }
         curl_multi_remove_handle(c->multi, hs[i]);
         curl_easy_cleanup(hs[i]);
+        if (hh[i]) { curl_multi_remove_handle(c->multi, hh[i]);
+                     curl_easy_cleanup(hh[i]); }
+        free(hmem[i]);
     }
-    free(hs); free(bufs);
+    c->last_hedged = hedged;
+    c->last_newconn = newconn;
+    free(hs); free(bufs); free(hh); free(hb); free(hmem);
     return ok;
 }
 
@@ -799,15 +862,20 @@ int cmd_anchor_bench(int argc, char** argv) {
     const char* outp = NULL;
     const char* drop = NULL;
     const char* s3url = NULL;   /* ex: http://127.0.0.1:9000/wikiit */
+    int hedge_ms = 0;
     for (int i = 8; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--out")) outp = argv[i + 1];
         else if (!strcmp(argv[i], "--drop")) drop = argv[i + 1];
         else if (!strcmp(argv[i], "--s3")) s3url = argv[i + 1];
+        else if (!strcmp(argv[i], "--hedge")) hedge_ms = atoi(argv[i + 1]);
     }
     S3Ctx s3;
+    memset(&s3, 0, sizeof(s3));
     char s3_blocks[1024], s3_base[1024];
+    long hedged_tot = 0, newconn_tot = 0;
     if (s3url) {
         if (s3_init(&s3) != 0) { fprintf(stderr, "curl init?\n"); return 1; }
+        s3.hedge_ms = hedge_ms;
         snprintf(s3_blocks, sizeof(s3_blocks), "%s/blocks.bin", s3url);
         snprintf(s3_base, sizeof(s3_base), "%s/base.f16bin", s3url);
         fprintf(stderr, "mode S3 : %s (auth %s)\n", s3url,
@@ -969,6 +1037,8 @@ int cmd_anchor_bench(int argc, char** argv) {
                 bo += blen[c];
             }
             int ok = s3_wave(&s3, s3_blocks, soff, blen, sdst, nprobe);
+            hedged_tot += s3.last_hedged;
+            newconn_tot += s3.last_newconn;
             if (ok < nprobe && qi == 0)
                 fprintf(stderr, "S3 : %d/%d blocs recus\n", ok, nprobe);
             free(soff); free(sdst);
@@ -1153,6 +1223,7 @@ int cmd_anchor_bench(int argc, char** argv) {
                 rdst[e] = rows + (size_t)e * dim * 2;
             }
             s3_wave(&s3, s3_base, roff, rlen, rdst, nf);
+            hedged_tot += s3.last_hedged;
             free(roff); free(rlen); free(rdst);
         } else
         for (int e = 0; e < nf; e++) {
@@ -1208,6 +1279,10 @@ int cmd_anchor_bench(int argc, char** argv) {
                tmp[nn / 2], tmp[(int)(nn * 0.99)]);
     }
     printf("docs vus/req : %lld\n", (long long)(docs_seen_tot / nq));
+    if (s3url)
+        printf("S3 : hedge %d ms, GETs doubles/req : %.1f, connexions TCP "
+               "ouvertes/req (vague blocs) : %.1f\n", hedge_ms,
+               (double)hedged_tot / nq, (double)newconn_tot / nq);
     if (outp) {
         FILE* fo = fopen(outp, "wb");
         fwrite(out_ids, 4, (size_t)nq * 11, fo);
