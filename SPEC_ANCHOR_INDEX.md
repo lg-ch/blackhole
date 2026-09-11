@@ -245,6 +245,12 @@ lit que les survivants. Sélectivité < ~50k éligibles → force brute sur les
 | wiki-en 40M×1024d | K=40k, TQ1, np128/256/512, r300 | 0,940 / 0,962 / 0,974 | 28 / 44 / 76 ms | 39 / 65 / 104 | 170 Mo |
 | idem, TQ4 r100 | | 0,946 / 0,968 / 0,984 | 55 / 95 / 178 ms | | |
 | wiki-it, **S3 simulé 40 ms RTT** | TQ1 np128 r300 | 0,960 | 120 ms | ~245 | |
+| **wiki 323 langues 247M×1024d** | K=320k (hiérarchique depuis K=5k), TQ1, r300, np128/256/512/1024 | 0,892 / 0,932 / **0,960** / 0,970 | 42 / 63 / **98** / 165 ms | 102 / 104 / 151 / 264 | 1,3 Go (ancres f32 ; 330 Mo en int8) |
+| idem, **1 thread**, np512 | | 0,957 | 137 ms | 199 | |
+
+Δcos (regret de similarité) sur 247M : 0,0013-0,0018 en moyenne, p90 ≤ 0,005.
+Build 247M : GT exacte 28 min, K=5k direct 1 h 33, K=320k coarse 28 min, blocs 65 Go.
+Loi d'échelle mesurée 40M → 247M : docs à lire ×2 pour N ×6 (≈ N^0,4).
 | DEEP 10M×96d (sim) | K=10k, spill ε0,2, np64, TQ4, exact100 | 0,988 | — | — | |
 
 Repères externes sur la même GT : HNSW (hnswlib) wiki-10M plafonne à 0,965
