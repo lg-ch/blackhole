@@ -835,6 +835,11 @@ int cmd_anchor_build(int argc, char** argv) {
 typedef struct { float s; uint32_t id; } ScId;
 typedef struct { float s; const uint8_t* ent; } ScEnt;
 
+static int u64_cmp(const void* a, const void* b) {
+    uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
 static int scid_cmp(const void* a, const void* b) {
     float d = ((const ScId*)b)->s - ((const ScId*)a)->s;
     return d > 0 ? 1 : (d < 0 ? -1 : 0);
@@ -930,20 +935,17 @@ int cmd_anchor_bench(int argc, char** argv) {
        (copy_to_user + clear_page) en mono-thread — vu au perf.        */
     uint64_t* csrt = (uint64_t*)malloc((size_t)K * 8);
     memcpy(csrt, csz, (size_t)K * 8);
-    for (int i = 1; i < K; i++) {           /* tri insertion partiel suffit */
-        uint64_t v = csrt[i]; int j = i - 1;
-        while (j >= 0 && csrt[j] > v) { csrt[j + 1] = csrt[j]; j--; }
-        csrt[j + 1] = v;
-        if (i > 20000) break;
-    }
-    uint64_t p99 = csrt[(int)(K * 0.99)];
-    if (K > 20000) { /* tri partiel invalide au-dela : prend le max/2 */
-        uint64_t mx = 0;
-        for (int k = 0; k < K; k++) if (csz[k] > mx) mx = csz[k];
-        p99 = mx / 2;
-    }
+    qsort(csrt, (size_t)K, 8, u64_cmp);   /* vrai p99, quel que soit K */
+    uint64_t p99 = csrt[(size_t)((double)K * 0.99)];
     free(csrt);
-    size_t blk_cap = (size_t)nprobe * (p99 * 2 + 65536);
+    /* RSS = ancres + ce buffer : p99 x 1,5 suffit (realloc si une
+       requete depasse) ; l ancien max/2 x 2 gonflait a plusieurs Go */
+    /* besoin typique = nprobe x cellule MOYENNE (52 Mo a np256 sur
+       wikiall) ; on part de 2x la moyenne et on realloue (rare) si une
+       requete depasse. Dimensionner sur le max faisait 21 Go de RSS. */
+    uint64_t mean_cell = offs[K] / (uint64_t)K;
+    (void)p99;
+    size_t blk_cap = (size_t)nprobe * (mean_cell * 2 + 4096);
     uint8_t* blk = (uint8_t*)malloc(blk_cap);
     if (!blk) { fprintf(stderr, "OOM blocs\n"); return 1; }
     memset(blk, 0, blk_cap);                /* pre-fault des pages */
